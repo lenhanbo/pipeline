@@ -1,0 +1,3 @@
+# Optional online experiment tracking. The baseline can run without this file.
+wandb==0.19.11
+

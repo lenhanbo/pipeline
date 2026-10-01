@@ -1,0 +1,20 @@
+--extra-index-url https://download.pytorch.org/whl/cu128
+
+# GPU training (Windows/Linux, NVIDIA CUDA 12.8 runtime bundled in the wheels)
+torch==2.7.1
+torchvision==0.22.1
+
+# Data and image pipeline
+numpy==2.2.6
+Pillow==11.2.1
+opencv-python-headless==4.11.0.86
+scipy==1.15.3
+
+# Model utilities and experiment tracking
+einops==0.8.1
+PyYAML==6.0.2
+tqdm==4.67.1
+tensorboard==2.19.0
+matplotlib==3.10.3
+gdown==5.2.0
+
