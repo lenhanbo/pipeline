@@ -1,5 +1,9 @@
 # Handwriting GAN pipeline
 
+> The standalone masked image merger is documented in
+> [`MERGER_README.md`](MERGER_README.md). It uses the existing IAM word files
+> directly and does not depend on the legacy VATr pickle data.
+
 Baseline sinh chữ viết tay tiếng Anh theo phong cách của một writer. Mô hình sẽ
 được huấn luyện trên IAM ở mức word; paragraph được tạo bằng cách sinh từng word
 rồi ghép chúng bằng một layout engine.

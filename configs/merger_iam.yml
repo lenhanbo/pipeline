@@ -1,0 +1,61 @@
+seed: 123456
+device: cuda
+
+data:
+  root: ../data/iam_dataset
+  train_gt: train_gt.txt
+  val_gt: val_gt.txt
+  max_train_samples: null
+  max_val_samples: null
+
+corruption:
+  window_width: 256
+  image_height: 32
+  edit_width: 32
+  center_gap_width: 2
+  min_side_width: 16
+  continuation_jitter: 0.10
+  mask_probability: 0.80
+  rotation_degrees: 8.0
+  translate_x: 6
+  translate_y: 4
+  shear_degrees: 8.0
+  scale_min: 0.90
+  scale_max: 1.10
+  geometry_identity_probability: 0.20
+
+model:
+  image_height: 32
+  window_width: 256
+  base_channels: 64
+  bottleneck_dim: 256
+  transformer_layers: 4
+  transformer_heads: 8
+  transformer_ffn_dim: 1024
+  dropout: 0.10
+  residual_scale: 0.50
+
+loss:
+  charbonnier_weight: 1.0
+  ssim_weight: 0.5
+  sobel_weight: 0.25
+  boundary_weight: 0.25
+  epsilon: 0.001
+
+training:
+  output_dir: runs/merger_iam
+  batch_size: 32
+  gradient_accumulation: 2
+  num_workers: 4
+  amp: true
+  learning_rate: 1.0e-4
+  weight_decay: 0.05
+  warmup_steps: 500
+  gradient_clip: 1.0
+  log_every: 20
+  eval_every: 500
+  validation_batches: 50
+  continuation:
+    max_steps: 15000
+  seam:
+    max_steps: 8000
