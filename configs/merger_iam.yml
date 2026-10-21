@@ -60,8 +60,10 @@ loss:
 
 training:
   output_dir: runs/merger_iam
-  batch_size: 32
-  gradient_accumulation: 2
+  # The 32x32 ViT input is small; a larger physical batch keeps a T4 busy.
+  # One optimizer update now needs one forward/backward pass instead of two.
+  batch_size: 128
+  gradient_accumulation: 1
   num_workers: 4
   amp: true
   learning_rate: 1.0e-4
