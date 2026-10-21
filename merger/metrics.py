@@ -14,6 +14,8 @@ def compute_metrics(
     edit_mask: torch.Tensor,
     valid_mask: torch.Tensor,
     input_image: torch.Tensor | None = None,
+    left_preservation_mask: torch.Tensor | None = None,
+    seam_mask: torch.Tensor | None = None,
 ) -> dict[str, float]:
     mask = edit_mask * valid_mask
     error = prediction - target
@@ -24,7 +26,7 @@ def compute_metrics(
     pred_x, pred_y = _sobel(prediction)
     target_x, target_y = _sobel(target)
     gradient_mae = masked_mean((pred_x - target_x).abs() + (pred_y - target_y).abs(), mask)
-    edges = boundary_mask(edit_mask) * valid_mask
+    edges = (seam_mask if seam_mask is not None else boundary_mask(edit_mask)) * valid_mask
     seam = masked_mean((pred_x - target_x).abs(), edges)
 
     pred_ink = (prediction < 0).float() * mask
@@ -36,6 +38,10 @@ def compute_metrics(
     outside = valid_mask * (1.0 - edit_mask)
     preservation_error = prediction - (input_image if input_image is not None else target)
     outside_mae = masked_mean(preservation_error.abs(), outside)
+    left_preservation_mae = masked_mean(
+        preservation_error.abs(),
+        (left_preservation_mask if left_preservation_mask is not None else outside) * valid_mask,
+    )
     return {
         "mae": float(mae),
         "psnr": psnr,
@@ -46,6 +52,7 @@ def compute_metrics(
         "ink_recall": float(recall),
         "ink_f1": float(f1),
         "outside_mask_mae": float(outside_mae),
+        "left_preservation_mae": float(left_preservation_mae),
     }
 
 

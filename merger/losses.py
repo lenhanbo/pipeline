@@ -40,20 +40,12 @@ def boundary_mask(edit_mask: torch.Tensor) -> torch.Tensor:
 class MergerLoss(nn.Module):
     def __init__(
         self,
-        charbonnier_weight: float = 1.0,
-        ssim_weight: float = 0.5,
-        sobel_weight: float = 0.25,
-        boundary_weight: float = 0.25,
-        epsilon: float = 1e-3,
+        l1_weight: float = 1.0,
+        left_identity_weight: float = 0.5,
     ) -> None:
         super().__init__()
-        self.weights = {
-            "charbonnier": charbonnier_weight,
-            "ssim": ssim_weight,
-            "sobel": sobel_weight,
-            "boundary": boundary_weight,
-        }
-        self.epsilon = epsilon
+        self.l1_weight = l1_weight
+        self.left_identity_weight = left_identity_weight
 
     def forward(
         self,
@@ -61,30 +53,22 @@ class MergerLoss(nn.Module):
         target: torch.Tensor,
         edit_mask: torch.Tensor,
         valid_mask: torch.Tensor,
-        include_boundary: bool = True,
+        input_image: torch.Tensor | None = None,
+        left_preservation_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         mask = edit_mask * valid_mask
-        difference = prediction - target
-        charbonnier = masked_mean(torch.sqrt(difference.square() + self.epsilon**2), mask)
-        ssim = masked_mean(1.0 - _ssim_map(prediction, target), mask)
-        pred_x, pred_y = _sobel(prediction)
-        target_x, target_y = _sobel(target)
-        sobel = masked_mean((pred_x - target_x).abs() + (pred_y - target_y).abs(), mask)
-        edges = boundary_mask(edit_mask) * valid_mask
-        boundary = masked_mean((pred_x - target_x).abs(), edges)
-
-        total = (
-            self.weights["charbonnier"] * charbonnier
-            + self.weights["ssim"] * ssim
-            + self.weights["sobel"] * sobel
-        )
-        if include_boundary:
-            total = total + self.weights["boundary"] * boundary
+        reconstruction_l1 = masked_mean((prediction - target).abs(), mask)
+        if input_image is not None and left_preservation_mask is not None:
+            left_identity_l1 = masked_mean(
+                (prediction - input_image).abs(),
+                left_preservation_mask * valid_mask,
+            )
+        else:
+            left_identity_l1 = prediction.new_zeros(())
+        total = self.l1_weight * reconstruction_l1 + self.left_identity_weight * left_identity_l1
         values = {
             "loss": total,
-            "charbonnier": charbonnier,
-            "ssim_loss": ssim,
-            "sobel_loss": sobel,
-            "boundary_loss": boundary,
+            "reconstruction_l1": reconstruction_l1,
+            "left_identity_l1": left_identity_l1,
         }
         return total, values

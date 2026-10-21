@@ -9,6 +9,7 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 from merger.losses import MergerLoss
+from merger.data import merger_collate
 from merger.runtime import (
     append_metrics,
     build_dataset,
@@ -59,8 +60,12 @@ def main() -> None:
         "num_workers": int(training.get("num_workers", 0)),
         "pin_memory": device.type == "cuda",
     }
-    train_loader = DataLoader(train_dataset, shuffle=True, drop_last=True, **loader_options)
-    val_loader = DataLoader(val_dataset, shuffle=False, drop_last=False, **loader_options)
+    train_loader = DataLoader(
+        train_dataset, shuffle=True, drop_last=True, collate_fn=merger_collate, **loader_options
+    )
+    val_loader = DataLoader(
+        val_dataset, shuffle=False, drop_last=False, collate_fn=merger_collate, **loader_options
+    )
 
     model = build_model(config).to(device)
     loss_fn = MergerLoss(**config.get("loss", {})).to(device)
@@ -111,13 +116,20 @@ def main() -> None:
                 raw_batch = next(data_iterator)
             batch = move_batch(raw_batch, device)
             with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp_enabled):
-                prediction = model(batch["corrupted"], batch["corruption_mask"], batch["edit_mask"])
+                prediction = model(
+                    batch["corrupted"],
+                    batch["corruption_mask"],
+                    batch["edit_mask"],
+                    batch["prefix_context"],
+                    batch["prefix_mask"],
+                )
                 loss, components = loss_fn(
                     prediction,
                     batch["target"],
                     batch["edit_mask"],
                     batch["valid_mask"],
-                    include_boundary=args.stage == "seam",
+                    input_image=batch["corrupted"],
+                    left_preservation_mask=batch["left_preservation_mask"],
                 )
                 scaled_loss = loss / accumulation
             scaler.scale(scaled_loss).backward()

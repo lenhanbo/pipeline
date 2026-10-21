@@ -6,6 +6,7 @@ from pathlib import Path
 import torch
 from torch.utils.data import DataLoader
 
+from merger.data import merger_collate
 from merger.runtime import build_dataset, build_model, evaluate_loader, load_config, save_json, seed_everything
 
 
@@ -48,6 +49,7 @@ def main() -> None:
             batch_size=int(config["training"]["batch_size"]),
             shuffle=False,
             num_workers=int(config["training"].get("num_workers", 0)),
+            collate_fn=merger_collate,
         )
         results[suite] = evaluate_loader(
             model,

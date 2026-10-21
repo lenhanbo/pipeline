@@ -1,92 +1,65 @@
 from __future__ import annotations
 
+import math
+
 import torch
 from torch import nn
-from torch.nn import functional as F
 
 
-def _groups(channels: int) -> int:
-    for groups in (8, 4, 2, 1):
-        if channels % groups == 0:
-            return groups
-    return 1
-
-
-class ConvBlock(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int) -> None:
-        super().__init__()
-        self.block = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, 3, padding=1),
-            nn.GroupNorm(_groups(out_channels), out_channels),
-            nn.GELU(),
-            nn.Conv2d(out_channels, out_channels, 3, padding=1),
-            nn.GroupNorm(_groups(out_channels), out_channels),
-            nn.GELU(),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.block(x)
-
-
-class DownBlock(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int) -> None:
-        super().__init__()
-        self.down = nn.Conv2d(in_channels, out_channels, 4, stride=2, padding=1)
-        self.block = ConvBlock(out_channels, out_channels)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.block(self.down(x))
-
-
-class UpBlock(nn.Module):
-    def __init__(self, in_channels: int, skip_channels: int, out_channels: int) -> None:
-        super().__init__()
-        self.block = ConvBlock(in_channels + skip_channels, out_channels)
-
-    def forward(self, x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
-        x = F.interpolate(x, size=skip.shape[-2:], mode="bilinear", align_corners=False)
-        return self.block(torch.cat((x, skip), dim=1))
+def _sinusoidal_position(length: int, dimension: int, reference: torch.Tensor) -> torch.Tensor:
+    positions = torch.arange(length, device=reference.device, dtype=reference.dtype).unsqueeze(1)
+    frequencies = torch.exp(
+        torch.arange(0, dimension, 2, device=reference.device, dtype=reference.dtype)
+        * (-math.log(10000.0) / dimension)
+    )
+    encoding = reference.new_zeros((1, length, dimension))
+    encoding[..., 0::2] = torch.sin(positions * frequencies)
+    encoding[..., 1::2] = torch.cos(positions * frequencies[: encoding[..., 1::2].size(-1)])
+    return encoding
 
 
 class MergerNet(nn.Module):
-    """Residual U-Net that may alter pixels only inside ``edit_mask``.
-
-    The three input channels are the corrupted image, a missing-pixel mask, and
-    the editable-region mask. Images are expected in [-1, 1], masks in [0, 1].
-    """
+    """Residual ViT merger for two adjacent handwriting patches."""
 
     def __init__(
         self,
         image_height: int = 32,
-        window_width: int = 256,
-        base_channels: int = 64,
-        bottleneck_dim: int = 256,
-        transformer_layers: int = 4,
+        patch_width: int = 16,
+        window_width: int = 32,
+        vit_patch_size: int = 4,
+        embed_dim: int = 256,
+        transformer_layers: int = 6,
         transformer_heads: int = 8,
         transformer_ffn_dim: int = 1024,
+        prefix_transformer_layers: int = 2,
         dropout: float = 0.1,
-        residual_scale: float = 0.5,
+        residual_scale: float = 2.0,
     ) -> None:
         super().__init__()
-        if image_height % 8 or window_width % 8:
-            raise ValueError("image_height and window_width must be divisible by 8")
-        if bottleneck_dim % transformer_heads:
-            raise ValueError("bottleneck_dim must be divisible by transformer_heads")
+        if window_width != 2 * patch_width:
+            raise ValueError("window_width must equal 2 * patch_width")
+        if image_height % vit_patch_size or window_width % vit_patch_size:
+            raise ValueError("image dimensions must be divisible by vit_patch_size")
+        if embed_dim % transformer_heads:
+            raise ValueError("embed_dim must be divisible by transformer_heads")
 
-        c = base_channels
         self.image_height = image_height
+        self.patch_width = patch_width
         self.window_width = window_width
+        self.vit_patch_size = vit_patch_size
+        self.embed_dim = embed_dim
         self.residual_scale = residual_scale
-        self.stem = ConvBlock(3, c)
-        self.down1 = DownBlock(c, c * 2)
-        self.down2 = DownBlock(c * 2, c * 4)
-        self.down3 = DownBlock(c * 4, bottleneck_dim)
 
-        token_count = (image_height // 8) * (window_width // 8)
-        self.position = nn.Parameter(torch.zeros(1, token_count, bottleneck_dim))
-        nn.init.trunc_normal_(self.position, std=0.02)
-        layer = nn.TransformerEncoderLayer(
-            d_model=bottleneck_dim,
+        # One complete generated character patch becomes one prefix token.
+        prefix_pixels = image_height * patch_width
+        self.prefix_patch_encoder = nn.Sequential(
+            nn.LayerNorm(prefix_pixels),
+            nn.Linear(prefix_pixels, embed_dim),
+            nn.GELU(),
+            nn.Linear(embed_dim, embed_dim),
+        )
+        prefix_layer = nn.TransformerEncoderLayer(
+            d_model=embed_dim,
             nhead=transformer_heads,
             dim_feedforward=transformer_ffn_dim,
             dropout=dropout,
@@ -94,20 +67,97 @@ class MergerNet(nn.Module):
             batch_first=True,
             norm_first=True,
         )
-        self.transformer = nn.TransformerEncoder(
-            layer, num_layers=transformer_layers, norm=nn.LayerNorm(bottleneck_dim)
+        self.prefix_transformer = nn.TransformerEncoder(
+            prefix_layer,
+            num_layers=prefix_transformer_layers,
+            norm=nn.LayerNorm(embed_dim),
         )
 
-        self.up2 = UpBlock(bottleneck_dim, c * 4, c * 4)
-        self.up1 = UpBlock(c * 4, c * 2, c * 2)
-        self.up0 = UpBlock(c * 2, c, c)
-        self.head = nn.Conv2d(c, 1, 1)
+        # Local ViT input: grayscale image + corruption mask + edit mask.
+        self.local_patch_embed = nn.Conv2d(
+            3,
+            embed_dim,
+            kernel_size=vit_patch_size,
+            stride=vit_patch_size,
+        )
+        local_token_count = (image_height // vit_patch_size) * (window_width // vit_patch_size)
+        self.local_position = nn.Parameter(torch.zeros(1, local_token_count, embed_dim))
+        self.prefix_role = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        nn.init.trunc_normal_(self.local_position, std=0.02)
+        nn.init.trunc_normal_(self.prefix_role, std=0.02)
+
+        merger_layer = nn.TransformerEncoderLayer(
+            d_model=embed_dim,
+            nhead=transformer_heads,
+            dim_feedforward=transformer_ffn_dim,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.merger_transformer = nn.TransformerEncoder(
+            merger_layer,
+            num_layers=transformer_layers,
+            norm=nn.LayerNorm(embed_dim),
+        )
+        self.patch_decoder = nn.Linear(embed_dim, vit_patch_size * vit_patch_size)
+        # Identity initialization stabilizes the first updates of the merger.
+        nn.init.zeros_(self.patch_decoder.weight)
+        nn.init.zeros_(self.patch_decoder.bias)
+
+    def _encode_prefix(
+        self, prefix_context: torch.Tensor, prefix_mask: torch.Tensor
+    ) -> torch.Tensor:
+        batch = prefix_context.size(0)
+        prefix_patches = prefix_context.unfold(-1, self.patch_width, self.patch_width)
+        prefix_patches = prefix_patches.permute(0, 3, 1, 2, 4).contiguous()
+        prefix_patches = prefix_patches.view(batch, -1, self.image_height * self.patch_width)
+        prefix_tokens = self.prefix_patch_encoder(prefix_patches)
+
+        patch_mask = prefix_mask.unfold(-1, self.patch_width, self.patch_width)
+        token_valid = patch_mask.amax(dim=(1, 2, 4)).bool()
+        causal_mask = torch.triu(
+            torch.ones(
+                prefix_tokens.size(1),
+                prefix_tokens.size(1),
+                dtype=torch.bool,
+                device=prefix_tokens.device,
+            ),
+            diagonal=1,
+        )
+        prefix_tokens = self.prefix_transformer(
+            prefix_tokens
+            + _sinusoidal_position(prefix_tokens.size(1), self.embed_dim, prefix_tokens),
+            mask=causal_mask,
+            src_key_padding_mask=~token_valid,
+        )
+        last_indices = token_valid.sum(dim=1).clamp_min(1) - 1
+        return prefix_tokens[
+            torch.arange(batch, device=prefix_tokens.device), last_indices
+        ].unsqueeze(1)
+
+    def _unpatchify(self, patches: torch.Tensor) -> torch.Tensor:
+        batch = patches.size(0)
+        grid_height = self.image_height // self.vit_patch_size
+        grid_width = self.window_width // self.vit_patch_size
+        patches = patches.view(
+            batch,
+            grid_height,
+            grid_width,
+            1,
+            self.vit_patch_size,
+            self.vit_patch_size,
+        )
+        patches = patches.permute(0, 3, 1, 4, 2, 5).contiguous()
+        return patches.view(batch, 1, self.image_height, self.window_width)
 
     def forward(
         self,
         image: torch.Tensor,
         corruption_mask: torch.Tensor,
         edit_mask: torch.Tensor,
+        prefix_context: torch.Tensor,
+        prefix_mask: torch.Tensor,
     ) -> torch.Tensor:
         if image.shape != corruption_mask.shape or image.shape != edit_mask.shape:
             raise ValueError("image and masks must have identical [B,1,H,W] shapes")
@@ -116,19 +166,19 @@ class MergerNet(nn.Module):
                 f"expected spatial shape {(self.image_height, self.window_width)}, "
                 f"got {tuple(image.shape[-2:])}"
             )
+        if prefix_context.shape != prefix_mask.shape or prefix_context.size(0) != image.size(0):
+            raise ValueError("prefix_context and prefix_mask must have identical [B,1,H,W] shapes")
+        if prefix_context.size(-2) != self.image_height:
+            raise ValueError(f"prefix height must be {self.image_height}")
+        if prefix_context.size(-1) % self.patch_width:
+            raise ValueError("padded prefix width must be divisible by patch_width")
 
-        e0 = self.stem(torch.cat((image, corruption_mask, edit_mask), dim=1))
-        e1 = self.down1(e0)
-        e2 = self.down2(e1)
-        bottleneck = self.down3(e2)
-
-        batch, channels, height, width = bottleneck.shape
-        tokens = bottleneck.flatten(2).transpose(1, 2)
-        tokens = self.transformer(tokens + self.position[:, : tokens.size(1)])
-        bottleneck = tokens.transpose(1, 2).reshape(batch, channels, height, width)
-
-        decoded = self.up2(bottleneck, e2)
-        decoded = self.up1(decoded, e1)
-        decoded = self.up0(decoded, e0)
-        delta = torch.tanh(self.head(decoded)) * self.residual_scale
-        return (image + edit_mask * delta).clamp(-1.0, 1.0)
+        prefix_state = self._encode_prefix(prefix_context, prefix_mask)
+        local = torch.cat((image, corruption_mask, edit_mask), dim=1)
+        local_tokens = self.local_patch_embed(local).flatten(2).transpose(1, 2)
+        fused = torch.cat(
+            (prefix_state + self.prefix_role, local_tokens + self.local_position), dim=1
+        )
+        local_output = self.merger_transformer(fused)[:, 1:]
+        delta = torch.tanh(self._unpatchify(self.patch_decoder(local_output)))
+        return (image + edit_mask * delta * self.residual_scale).clamp(-1.0, 1.0)

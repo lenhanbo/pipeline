@@ -97,20 +97,41 @@ def evaluate_loader(
         if max_batches is not None and batch_index >= max_batches:
             break
         batch = move_batch(raw_batch, device)
-        prediction = model(batch["corrupted"], batch["corruption_mask"], batch["edit_mask"])
+        prediction = model(
+            batch["corrupted"],
+            batch["corruption_mask"],
+            batch["edit_mask"],
+            batch["prefix_context"],
+            batch["prefix_mask"],
+        )
         noop = batch["corrupted"]
-        edge_baseline = edge_copy_baseline(batch["corrupted"], batch["edit_mask"])
+        edge_baseline = edge_copy_baseline(batch["corrupted"], batch["seam_mask"])
         model_metrics.append(
             compute_metrics(
-                prediction, batch["target"], batch["edit_mask"], batch["valid_mask"], batch["corrupted"]
+                prediction,
+                batch["target"],
+                batch["edit_mask"],
+                batch["valid_mask"],
+                batch["corrupted"],
+                batch["left_preservation_mask"],
+                batch["seam_mask"],
             )
         )
         noop_metrics.append(
-            compute_metrics(noop, batch["target"], batch["edit_mask"], batch["valid_mask"], batch["corrupted"])
+            compute_metrics(
+                noop, batch["target"], batch["edit_mask"], batch["valid_mask"],
+                batch["corrupted"], batch["left_preservation_mask"], batch["seam_mask"]
+            )
         )
         edge_metrics.append(
             compute_metrics(
-                edge_baseline, batch["target"], batch["edit_mask"], batch["valid_mask"], batch["corrupted"]
+                edge_baseline,
+                batch["target"],
+                batch["edit_mask"],
+                batch["valid_mask"],
+                batch["corrupted"],
+                batch["left_preservation_mask"],
+                batch["seam_mask"],
             )
         )
         if preview is None:
@@ -118,9 +139,16 @@ def evaluate_loader(
             images = torch.cat(
                 (
                     batch["target"][:8],
+                    torch.nn.functional.interpolate(
+                        batch["prefix_context"][:8],
+                        size=batch["target"].shape[-2:],
+                        mode="bilinear",
+                        align_corners=False,
+                    ),
                     batch["corrupted"][:8],
                     batch["corruption_mask"][:8].mul(2).sub(1),
                     batch["edit_mask"][:8].mul(2).sub(1),
+                    batch["left_preservation_mask"][:8].mul(2).sub(1),
                     noop[:8],
                     edge_baseline[:8],
                     prediction[:8],
