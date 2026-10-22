@@ -1,4 +1,4 @@
-"""Masked handwriting seam-merging baseline."""
+"""End-to-end two-image handwriting merger baseline."""
 
 from .model import MergerNet
 

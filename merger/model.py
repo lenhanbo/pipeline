@@ -19,7 +19,7 @@ def _sinusoidal_position(length: int, dimension: int, reference: torch.Tensor) -
 
 
 class MergerNet(nn.Module):
-    """Residual ViT merger for two adjacent handwriting patches."""
+    """Direct ViT generator that merges two independently supplied patches."""
 
     def __init__(
         self,
@@ -33,7 +33,6 @@ class MergerNet(nn.Module):
         transformer_ffn_dim: int = 1024,
         prefix_transformer_layers: int = 2,
         dropout: float = 0.1,
-        residual_scale: float = 2.0,
     ) -> None:
         super().__init__()
         if window_width != 2 * patch_width:
@@ -48,7 +47,6 @@ class MergerNet(nn.Module):
         self.window_width = window_width
         self.vit_patch_size = vit_patch_size
         self.embed_dim = embed_dim
-        self.residual_scale = residual_scale
 
         # One complete generated character patch becomes one prefix token.
         prefix_pixels = image_height * patch_width
@@ -73,18 +71,24 @@ class MergerNet(nn.Module):
             norm=nn.LayerNorm(embed_dim),
         )
 
-        # Local ViT input: grayscale image + corruption mask + edit mask.
-        self.local_patch_embed = nn.Conv2d(
-            3,
+        # Each image branch is embedded independently. The second channel tells
+        # the model which pixels in that branch were geometrically corrupted.
+        self.image_patch_embed = nn.Conv2d(
+            2,
             embed_dim,
             kernel_size=vit_patch_size,
             stride=vit_patch_size,
         )
-        local_token_count = (image_height // vit_patch_size) * (window_width // vit_patch_size)
-        self.local_position = nn.Parameter(torch.zeros(1, local_token_count, embed_dim))
+        patch_token_count = (image_height // vit_patch_size) * (patch_width // vit_patch_size)
+        self.patch_token_count = patch_token_count
+        self.patch_position = nn.Parameter(torch.zeros(1, patch_token_count, embed_dim))
         self.prefix_role = nn.Parameter(torch.zeros(1, 1, embed_dim))
-        nn.init.trunc_normal_(self.local_position, std=0.02)
+        self.left_role = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        self.right_role = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        nn.init.trunc_normal_(self.patch_position, std=0.02)
         nn.init.trunc_normal_(self.prefix_role, std=0.02)
+        nn.init.trunc_normal_(self.left_role, std=0.02)
+        nn.init.trunc_normal_(self.right_role, std=0.02)
 
         merger_layer = nn.TransformerEncoderLayer(
             d_model=embed_dim,
@@ -101,9 +105,9 @@ class MergerNet(nn.Module):
             norm=nn.LayerNorm(embed_dim),
         )
         self.patch_decoder = nn.Linear(embed_dim, vit_patch_size * vit_patch_size)
-        # Identity initialization stabilizes the first updates of the merger.
-        nn.init.zeros_(self.patch_decoder.weight)
-        nn.init.zeros_(self.patch_decoder.bias)
+        # Start near a white canvas while still generating every output pixel.
+        nn.init.normal_(self.patch_decoder.weight, std=0.02)
+        nn.init.constant_(self.patch_decoder.bias, 1.5)
 
     def _encode_prefix(
         self, prefix_context: torch.Tensor, prefix_mask: torch.Tensor
@@ -136,37 +140,40 @@ class MergerNet(nn.Module):
             torch.arange(batch, device=prefix_tokens.device), last_indices
         ].unsqueeze(1)
 
-    def _unpatchify(self, patches: torch.Tensor) -> torch.Tensor:
-        batch = patches.size(0)
+    def _decode_canvas(self, tokens: torch.Tensor) -> torch.Tensor:
+        batch = tokens.size(0)
         grid_height = self.image_height // self.vit_patch_size
-        grid_width = self.window_width // self.vit_patch_size
+        branch_grid_width = self.patch_width // self.vit_patch_size
+        patches = self.patch_decoder(tokens)
         patches = patches.view(
             batch,
+            2,
             grid_height,
-            grid_width,
+            branch_grid_width,
             1,
             self.vit_patch_size,
             self.vit_patch_size,
         )
+        patches = torch.cat((patches[:, 0], patches[:, 1]), dim=2)
         patches = patches.permute(0, 3, 1, 4, 2, 5).contiguous()
         return patches.view(batch, 1, self.image_height, self.window_width)
 
     def forward(
         self,
-        image: torch.Tensor,
-        corruption_mask: torch.Tensor,
-        edit_mask: torch.Tensor,
+        left_image: torch.Tensor,
+        right_image: torch.Tensor,
+        left_corruption_mask: torch.Tensor,
+        right_corruption_mask: torch.Tensor,
         prefix_context: torch.Tensor,
         prefix_mask: torch.Tensor,
     ) -> torch.Tensor:
-        if image.shape != corruption_mask.shape or image.shape != edit_mask.shape:
-            raise ValueError("image and masks must have identical [B,1,H,W] shapes")
-        if image.shape[-2:] != (self.image_height, self.window_width):
-            raise ValueError(
-                f"expected spatial shape {(self.image_height, self.window_width)}, "
-                f"got {tuple(image.shape[-2:])}"
-            )
-        if prefix_context.shape != prefix_mask.shape or prefix_context.size(0) != image.size(0):
+        expected = (self.image_height, self.patch_width)
+        branch_tensors = (left_image, right_image, left_corruption_mask, right_corruption_mask)
+        if any(tensor.shape != left_image.shape for tensor in branch_tensors):
+            raise ValueError("left/right images and corruption masks must have identical shapes")
+        if left_image.shape[-2:] != expected:
+            raise ValueError(f"expected each input image to have shape {expected}")
+        if prefix_context.shape != prefix_mask.shape or prefix_context.size(0) != left_image.size(0):
             raise ValueError("prefix_context and prefix_mask must have identical [B,1,H,W] shapes")
         if prefix_context.size(-2) != self.image_height:
             raise ValueError(f"prefix height must be {self.image_height}")
@@ -174,11 +181,19 @@ class MergerNet(nn.Module):
             raise ValueError("padded prefix width must be divisible by patch_width")
 
         prefix_state = self._encode_prefix(prefix_context, prefix_mask)
-        local = torch.cat((image, corruption_mask, edit_mask), dim=1)
-        local_tokens = self.local_patch_embed(local).flatten(2).transpose(1, 2)
+        left_tokens = self.image_patch_embed(
+            torch.cat((left_image, left_corruption_mask), dim=1)
+        ).flatten(2).transpose(1, 2)
+        right_tokens = self.image_patch_embed(
+            torch.cat((right_image, right_corruption_mask), dim=1)
+        ).flatten(2).transpose(1, 2)
         fused = torch.cat(
-            (prefix_state + self.prefix_role, local_tokens + self.local_position), dim=1
+            (
+                prefix_state + self.prefix_role,
+                left_tokens + self.patch_position + self.left_role,
+                right_tokens + self.patch_position + self.right_role,
+            ),
+            dim=1,
         )
-        local_output = self.merger_transformer(fused)[:, 1:]
-        delta = torch.tanh(self._unpatchify(self.patch_decoder(local_output)))
-        return (image + edit_mask * delta * self.residual_scale).clamp(-1.0, 1.0)
+        output_tokens = self.merger_transformer(fused)[:, 1:]
+        return torch.tanh(self._decode_canvas(output_tokens))

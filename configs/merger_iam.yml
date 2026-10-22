@@ -19,20 +19,7 @@ corruption:
   edit_width: 32
   center_gap_width: 2
   min_side_width: 32
-  # Continuation pretraining keeps all pixels visible. It learns to undo only
-  # small geometric misalignment and image noise.
-  continuation_rotation_degrees: 3.0
-  continuation_translate_x: 3
-  continuation_translate_y: 2
-  continuation_shear_degrees: 2.0
-  continuation_scale_min: 0.97
-  continuation_scale_max: 1.03
-  continuation_geometry_probability: 0.90
-  continuation_noise_probability: 0.80
-  continuation_noise_std_min: 0.005
-  continuation_noise_std_max: 0.04
-  continuation_blur_probability: 0.25
-  # No random occlusion; seam still removes only the requested center line.
+  # No random occlusion; merge augmentation still removes the center join.
   mask_probability: 0.0
   rotation_degrees: 8.0
   translate_x: 6
@@ -53,8 +40,6 @@ model:
   transformer_ffn_dim: 1024
   prefix_transformer_layers: 2
   dropout: 0.10
-  # A full black-to-white or white-to-black correction spans 2.0 in [-1, 1].
-  residual_scale: 2.0
 
 loss:
   l1_weight: 1.0
@@ -62,7 +47,7 @@ loss:
 
 training:
   # Keep 32x32-character checkpoints separate from the incompatible 32x16 run.
-  output_dir: runs/merger_32x32
+  output_dir: runs/merger_e2e
   # The 32x64 ViT input is small; a larger physical batch keeps a T4 busy.
   # One optimizer update now needs one forward/backward pass instead of two.
   batch_size: 12
@@ -76,7 +61,6 @@ training:
   log_every: 20
   eval_every: 500
   validation_batches: 50
-  continuation:
+  # One end-to-end schedule; join repair is an augmentation, not a second stage.
+  merge:
     max_steps: 20000
-  seam:
-    max_steps: 10000

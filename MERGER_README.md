@@ -1,17 +1,23 @@
 # Handwriting Merger baseline
 
-`MergerNet` is an isolated ViT image-restoration baseline. Its continuation pretrain
-keeps the complete crop visible and learns to undo mild rotation (at most three
-degrees by default), translation, shear, scale, blur, and additive noise. It then
-learns to repair a 32-pixel seam after component-level corruptions. Random
-occlusion is disabled by default; the requested center gap is still removed. It
-does not yet generate characters.
+`MergerNet` is a single-stage, end-to-end ViT merger. Every training batch supplies
+two independent character images and the model directly generates their complete
+merged canvas. Geometry, photometric noise, overlap removal, and the two-pixel
+center gap are data augmentations inside the same `merge` stage; there is no
+continuation pretrain or separate seam fine-tune. It does not yet generate the
+individual character images upstream of the merger.
 
-The local merger is a pure residual ViT: it patchifies the `32x64` two-character
-window into `4x4` tokens, prepends the final causal prefix token, and projects
-the output tokens directly back to pixels. There is no U-Net or skip decoder.
+The merger is a direct ViT image generator. It receives the left `32x32` image
+and right `32x32` image as two independent tensors; it never receives a spatially
+pre-concatenated image. A shared patch embedder tokenizes each branch separately,
+learned left/right role embeddings preserve their identity, and the final causal
+prefix token conditions their joint Transformer. The decoder generates every
+pixel of two new `32x32` outputs, which the model joins into the final `32x64`
+canvas. There is no input-to-output residual addition, hard pixel copy, U-Net,
+or skip decoder.
 Training intentionally uses only two masked L1 terms: reconstruction against the
-clean target over both patches, and identity against the input over the stable
+clean target over both generated patches, and identity against the naive input
+concatenation over the stable
 part of the left patch. SSIM, Sobel, Charbonnier, boundary, perceptual, GAN, and
 CTC losses are not part of this first baseline.
 
@@ -34,7 +40,7 @@ excluding corrupted/overlap pixels near the join. The center band is deliberatel
 erased to remove the direct overlap cue and force reconstruction of a coherent
 connection between the two patches.
 
-Every seam sample also removes a configurable two-pixel vertical band centered
+Every merge sample also removes a configurable two-pixel vertical band centered
 on the split (one column per side). This guarantees that even an otherwise clean
 pair requires a real boundary reconstruction.
 
@@ -46,10 +52,10 @@ the IAM data already present in this workspace. Transcripts containing fewer
 than two non-whitespace characters are excluded from training, validation, and
 checkpoint analysis because they do not define a two-character merge boundary.
 
-The model consumes a grayscale image in `[-1,1]`, a restoration/corruption mask,
-and an edit mask. Continuation uses the whole valid crop as the editable region;
-it does not paint over or delete the input. Only pixels selected by the edit mask
-can change, so hard blending makes the outside-mask error exactly zero.
+The model consumes two grayscale images in `[-1,1]`, one corruption mask for
+each image, the complete prefix, and its padding mask. The combined `edit_mask`
+is used only to select reconstruction-loss and evaluation pixels; it is not fed
+to the model and does not hard-copy any input pixels into the output.
 
 ## Commands
 
@@ -57,21 +63,19 @@ From `pipeline/`:
 
 ```powershell
 python -m unittest tests.test_merger
-python train_merger.py --config configs/merger_iam.yml --stage continuation
-python train_merger.py --config configs/merger_iam.yml --stage seam `
-  --resume runs/merger_32x32/continuation/best_ssim.pth
-python evaluate_merger.py --config configs/merger_iam.yml --stage seam `
-  --checkpoint runs/merger_32x32/seam/best_seam.pth
+python train_merger.py --config configs/merger_iam.yml --stage merge
+python evaluate_merger.py --config configs/merger_iam.yml --stage merge `
+  --checkpoint runs/merger_e2e/merge/best_seam.pth
 python analyze_merger.py `
-  --checkpoint runs/merger_32x32/seam/best_seam.pth `
-  --stage seam --suite combined --selection worst_noise
+  --checkpoint runs/merger_e2e/merge/best_seam.pth `
+  --stage merge --suite combined --selection worst_noise
 ```
 
 Use `--data-root /kaggle/input/.../iam_dataset` and
-`--output-dir /kaggle/working/merger_32x32` on Kaggle. Checkpoints are self-contained
+`--output-dir /kaggle/working/merger_e2e` on Kaggle. Checkpoints are self-contained
 and include the resolved configuration, optimizer, scheduler, scaler, and step.
-Checkpoints from the older `32x16` character-patch layout are shape-incompatible;
-start continuation training from scratch after switching to this configuration.
+Checkpoints from the older staged or residual architectures are shape-incompatible
+with the two-input direct generator and must not be resumed.
 
 Evaluation writes fixed preview grids and JSON metrics for clean seams, masks,
 translation, rotation, shear/scale, photometric corruption, and their combination.

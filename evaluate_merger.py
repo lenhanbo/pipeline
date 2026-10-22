@@ -14,7 +14,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Evaluate merger corruption suites")
     parser.add_argument("--config", default="configs/merger_iam.yml")
     parser.add_argument("--checkpoint", required=True)
-    parser.add_argument("--stage", choices=("continuation", "seam"), default="seam")
+    parser.add_argument("--stage", choices=("merge",), default="merge")
     parser.add_argument("--data-root", default=None)
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--device", default=None)
@@ -31,18 +31,17 @@ def main() -> None:
     model.load_state_dict(checkpoint["model"])
 
     output_dir = Path(args.output_dir or Path(args.checkpoint).parent / "evaluation")
-    suites = ["continuation"] if args.stage == "continuation" else [
+    suites = [
         "clean", "mask", "translation", "rotation", "shear_scale", "photometric", "combined"
     ]
     results = {}
     for suite in suites:
-        stage = "continuation" if suite == "continuation" else "seam"
         dataset = build_dataset(
             config,
-            stage,
+            "merge",
             "val",
             deterministic=True,
-            force_corruption_type=None if stage == "continuation" else suite,
+            force_corruption_type=suite,
         )
         loader = DataLoader(
             dataset,

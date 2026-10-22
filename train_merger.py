@@ -24,9 +24,9 @@ from merger.runtime import (
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train the masked handwriting merger")
+    parser = argparse.ArgumentParser(description="Train the end-to-end handwriting merger")
     parser.add_argument("--config", default="configs/merger_iam.yml")
-    parser.add_argument("--stage", choices=("continuation", "seam"), required=True)
+    parser.add_argument("--stage", choices=("merge",), default="merge")
     parser.add_argument("--resume", default=None)
     parser.add_argument("--data-root", default=None)
     parser.add_argument("--output-dir", default=None)
@@ -117,18 +117,20 @@ def main() -> None:
             batch = move_batch(raw_batch, device)
             with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp_enabled):
                 prediction = model(
-                    batch["corrupted"],
-                    batch["corruption_mask"],
-                    batch["edit_mask"],
+                    batch["left_image"],
+                    batch["right_image"],
+                    batch["left_corruption_mask"],
+                    batch["right_corruption_mask"],
                     batch["prefix_context"],
                     batch["prefix_mask"],
                 )
+                naive_concat = torch.cat((batch["left_image"], batch["right_image"]), dim=-1)
                 loss, components = loss_fn(
                     prediction,
                     batch["target"],
                     batch["edit_mask"],
                     batch["valid_mask"],
-                    input_image=batch["corrupted"],
+                    input_image=naive_concat,
                     left_preservation_mask=batch["left_preservation_mask"],
                 )
                 scaled_loss = loss / accumulation

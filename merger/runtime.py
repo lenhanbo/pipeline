@@ -143,21 +143,22 @@ def evaluate_loader(
             break
         batch = move_batch(raw_batch, device)
         prediction = model(
-            batch["corrupted"],
-            batch["corruption_mask"],
-            batch["edit_mask"],
+            batch["left_image"],
+            batch["right_image"],
+            batch["left_corruption_mask"],
+            batch["right_corruption_mask"],
             batch["prefix_context"],
             batch["prefix_mask"],
         )
-        noop = batch["corrupted"]
-        edge_baseline = edge_copy_baseline(batch["corrupted"], batch["seam_mask"])
+        noop = torch.cat((batch["left_image"], batch["right_image"]), dim=-1)
+        edge_baseline = edge_copy_baseline(noop, batch["seam_mask"])
         model_metrics.append(
             compute_metrics(
                 prediction,
                 batch["target"],
                 batch["edit_mask"],
                 batch["valid_mask"],
-                batch["corrupted"],
+                noop,
                 batch["left_preservation_mask"],
                 batch["seam_mask"],
             )
@@ -165,7 +166,7 @@ def evaluate_loader(
         noop_metrics.append(
             compute_metrics(
                 noop, batch["target"], batch["edit_mask"], batch["valid_mask"],
-                batch["corrupted"], batch["left_preservation_mask"], batch["seam_mask"]
+                noop, batch["left_preservation_mask"], batch["seam_mask"]
             )
         )
         edge_metrics.append(
@@ -174,7 +175,7 @@ def evaluate_loader(
                 batch["target"],
                 batch["edit_mask"],
                 batch["valid_mask"],
-                batch["corrupted"],
+                noop,
                 batch["left_preservation_mask"],
                 batch["seam_mask"],
             )
@@ -191,7 +192,9 @@ def evaluate_loader(
             preview_rows = [
                 ("Target", to_image(batch["target"])),
                 ("Full prefix (resized)", to_image(prefix)),
-                ("Corrupted input", to_image(batch["corrupted"])),
+                ("Left input", to_image(batch["left_image"])),
+                ("Right input", to_image(batch["right_image"])),
+                ("Naive concatenation", to_image(noop)),
                 ("Corruption mask", batch["corruption_mask"][:count].clamp(0, 1)),
                 ("Edit mask", batch["edit_mask"][:count].clamp(0, 1)),
                 ("Left preserve mask", batch["left_preservation_mask"][:count].clamp(0, 1)),

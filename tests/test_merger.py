@@ -11,8 +11,7 @@ from PIL import Image, ImageDraw
 from merger.data import (
     CorruptionConfig,
     IAMMergerDataset,
-    make_continuation_sample,
-    make_seam_sample,
+    make_merge_sample,
     merger_collate,
 )
 from merger.losses import MergerLoss
@@ -44,26 +43,33 @@ class MergerTests(unittest.TestCase):
     def test_datasets_create_binary_masks(self) -> None:
         temporary = self._dataset_root()
         try:
-            for stage in ("continuation", "seam"):
+            for stage in ("merge",):
                 dataset = IAMMergerDataset(
                     temporary.root, "train_gt.txt", stage, deterministic=True  # type: ignore[attr-defined]
                 )
                 sample = dataset[0]
                 self.assertEqual(len(dataset), 4)
                 self.assertEqual(sample["target"].shape, (1, 32, 64))
+                self.assertEqual(sample["left_image"].shape, (1, 32, 32))
+                self.assertEqual(sample["right_image"].shape, (1, 32, 32))
+                self.assertTrue(
+                    torch.equal(
+                        torch.cat((sample["left_image"], sample["right_image"]), dim=-1),
+                        sample["naive_concat"],
+                    )
+                )
                 self.assertEqual(sample["prefix_context"].shape[0:2], (1, 32))
                 self.assertEqual(sample["prefix_context"].shape[-1], sample["global_cut"])
                 for key in ("corruption_mask", "edit_mask", "valid_mask"):
                     self.assertTrue(set(torch.unique(sample[key]).tolist()).issubset({0.0, 1.0}))
-                if stage == "seam":
-                    coverage = float(sample["edit_mask"].sum()) / 32
-                    self.assertEqual(coverage, 64)
-                    corruption_coverage = float(sample["corruption_mask"].sum())
-                    self.assertLessEqual(corruption_coverage, float(sample["edit_mask"].sum()))
-                    self.assertTrue(torch.all(sample["corrupted"][sample["seam_mask"].bool()] == 1.0))
-                    self.assertEqual(
-                        float((sample["left_preservation_mask"] * sample["seam_mask"]).sum()), 0.0
-                    )
+                coverage = float(sample["edit_mask"].sum()) / 32
+                self.assertEqual(coverage, 64)
+                corruption_coverage = float(sample["corruption_mask"].sum())
+                self.assertLessEqual(corruption_coverage, float(sample["edit_mask"].sum()))
+                self.assertTrue(torch.all(sample["naive_concat"][sample["seam_mask"].bool()] == 1.0))
+                self.assertEqual(
+                    float((sample["left_preservation_mask"] * sample["seam_mask"]).sum()), 0.0
+                )
         finally:
             temporary.cleanup()
 
@@ -72,7 +78,7 @@ class MergerTests(unittest.TestCase):
         target[:, 12:20, 4:60] = -1
         cfg = CorruptionConfig()
         for kind in ("rotation", "translation", "shear_scale", "mask", "combined", "clean"):
-            sample = make_seam_sample(
+            sample = make_merge_sample(
                 target,
                 64,
                 cfg,
@@ -80,32 +86,12 @@ class MergerTests(unittest.TestCase):
                 torch.Generator().manual_seed(7),
                 force_type=kind,
             )
-            self.assertEqual(sample["corrupted"].shape, target.shape)
+            self.assertEqual(sample["naive_concat"].shape, target.shape)
             self.assertTrue(set(torch.unique(sample["corruption_mask"]).tolist()).issubset({0.0, 1.0}))
             cut = int(sample["cut"])
             self.assertGreater(float(sample["corruption_mask"][..., cut - 1 : cut + 1].sum()), 0)
 
-    def test_continuation_keeps_content_visible_and_uses_mild_geometry(self) -> None:
-        target = torch.ones(1, 32, 64)
-        target[:, 12:20, 4:60] = -1
-        cfg = CorruptionConfig(
-            continuation_geometry_probability=1.0,
-            continuation_noise_probability=1.0,
-        )
-        sample = make_continuation_sample(
-            target,
-            64,
-            cfg,
-            __import__("random").Random(7),
-            torch.Generator().manual_seed(7),
-        )
-        corrupted = sample["corrupted"]
-        self.assertEqual(corrupted.shape, target.shape)
-        self.assertGreater(float((corrupted < 0.9).sum()), 0)
-        self.assertFalse(bool(torch.all(corrupted[sample["edit_mask"].bool()] == 1.0)))
-        self.assertEqual(sample["corruption_type"], "alignment_noise")
-
-    def test_model_hard_blend_and_backward(self) -> None:
+    def test_model_generates_full_merge_and_backward(self) -> None:
         model = MergerNet(
             patch_width=32,
             window_width=64,
@@ -117,23 +103,34 @@ class MergerTests(unittest.TestCase):
             transformer_ffn_dim=64,
             dropout=0.0,
         )
-        image = torch.rand(2, 1, 32, 64) * 2 - 1
+        left_image = torch.rand(2, 1, 32, 32) * 2 - 1
+        right_image = torch.rand(2, 1, 32, 32) * 2 - 1
         prefix = torch.rand(2, 1, 32, 64) * 2 - 1
         prefix_mask = torch.ones_like(prefix)
-        corruption = torch.zeros_like(image)
-        edit = torch.zeros_like(image)
-        edit[..., 16:48] = 1
-        target = image.clone()
-        target[..., 16:48] = 0
-        prediction = model(image, corruption, edit, prefix, prefix_mask)
-        self.assertTrue(torch.equal(prediction * (1 - edit), image * (1 - edit)))
+        left_corruption = torch.zeros_like(left_image)
+        right_corruption = torch.zeros_like(right_image)
+        target = torch.cat((left_image, right_image), dim=-1)
+        edit = torch.ones_like(target)
+        prediction = model(
+            left_image,
+            right_image,
+            left_corruption,
+            right_corruption,
+            prefix,
+            prefix_mask,
+        )
+        self.assertEqual(prediction.shape, target.shape)
+        self.assertTrue(torch.all(prediction >= -1.0))
+        self.assertTrue(torch.all(prediction <= 1.0))
         loss, parts = MergerLoss()(
             prediction,
             target,
             edit,
             torch.ones_like(edit),
-            input_image=image,
-            left_preservation_mask=(1 - edit),
+            input_image=target,
+            left_preservation_mask=torch.cat(
+                (torch.ones_like(left_image), torch.zeros_like(right_image)), dim=-1
+            ),
         )
         self.assertEqual(set(parts), {"loss", "reconstruction_l1", "left_identity_l1"})
         loss.backward()
@@ -146,7 +143,7 @@ class MergerTests(unittest.TestCase):
         temporary = self._dataset_root()
         try:
             dataset = IAMMergerDataset(
-                temporary.root, "train_gt.txt", "seam", deterministic=True  # type: ignore[attr-defined]
+                temporary.root, "train_gt.txt", "merge", deterministic=True  # type: ignore[attr-defined]
             )
             batch = merger_collate([dataset[0], dataset[1]])
             self.assertEqual(batch["prefix_context"].shape, batch["prefix_mask"].shape)

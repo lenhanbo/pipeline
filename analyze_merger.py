@@ -22,7 +22,7 @@ from merger.runtime import (
 )
 
 
-SEAM_SUITES = ("clean", "mask", "translation", "rotation", "shear_scale", "photometric", "combined")
+MERGE_SUITES = ("clean", "mask", "translation", "rotation", "shear_scale", "photometric", "combined")
 SELECTIONS = ("random", "worst_mae", "best_mae", "worst_seam", "worst_noise")
 
 
@@ -30,8 +30,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Render and rank merger checkpoint examples")
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--config", default="configs/merger_iam.yml")
-    parser.add_argument("--stage", choices=("continuation", "seam"), default=None)
-    parser.add_argument("--suite", choices=SEAM_SUITES, default="combined")
+    parser.add_argument("--stage", choices=("merge",), default="merge")
+    parser.add_argument("--suite", choices=MERGE_SUITES, default="combined")
     parser.add_argument("--split", choices=("train", "val"), default="val")
     parser.add_argument("--selection", choices=SELECTIONS, default="worst_noise")
     parser.add_argument("--num-samples", type=int, default=24)
@@ -68,7 +68,8 @@ def _record_batch(
     batch: dict[str, Any],
     dataset_indices: list[int],
 ) -> list[dict[str, Any]]:
-    edge = edge_copy_baseline(batch["corrupted"], batch["seam_mask"])
+    naive_concat = torch.cat((batch["left_image"], batch["right_image"]), dim=-1)
+    edge = edge_copy_baseline(naive_concat, batch["seam_mask"])
     records: list[dict[str, Any]] = []
     for index in range(prediction.size(0)):
         item = {key: value[index : index + 1] for key, value in batch.items() if isinstance(value, torch.Tensor)}
@@ -77,7 +78,7 @@ def _record_batch(
             item["target"],
             item["edit_mask"],
             item["valid_mask"],
-            item["corrupted"],
+            naive_concat[index : index + 1],
             item["left_preservation_mask"],
             item["seam_mask"],
         )
@@ -90,7 +91,9 @@ def _record_batch(
                 "global_cut": int(batch["global_cut"][index]),
                 "metrics": metrics,
                 "target": item["target"].cpu(),
-                "corrupted": item["corrupted"].cpu(),
+                "left_image": item["left_image"].cpu(),
+                "right_image": item["right_image"].cpu(),
+                "naive_concat": naive_concat[index : index + 1].cpu(),
                 "corruption_mask": item["corruption_mask"].cpu(),
                 "left_preservation_mask": item["left_preservation_mask"].cpu(),
                 "seam_mask": item["seam_mask"].cpu(),
@@ -138,19 +141,21 @@ def _save_pages(records: list[dict[str, Any]], output_dir: Path, page_size: int)
         page = records[page_start : page_start + page_size]
         stack = lambda name: torch.cat([item[name] for item in page], dim=0)
         target = stack("target")
-        corrupted = stack("corrupted")
+        naive_concat = stack("naive_concat")
         prediction = stack("prediction")
         rows = [
             ("Target", _image01(target)),
-            ("Corrupted input", _image01(corrupted)),
+            ("Left input", _image01(stack("left_image"))),
+            ("Right input", _image01(stack("right_image"))),
+            ("Naive concatenation", _image01(naive_concat)),
             ("Corruption mask", stack("corruption_mask").clamp(0, 1)),
             ("Left preserve mask", stack("left_preservation_mask").clamp(0, 1)),
             ("Seam mask", stack("seam_mask").clamp(0, 1)),
-            ("No-op baseline", _image01(corrupted)),
+            ("No-op baseline", _image01(naive_concat)),
             ("Edge-copy baseline", _image01(stack("edge"))),
             ("Model prediction", _image01(prediction)),
             ("Absolute error", (prediction - target).abs().div(2).clamp(0, 1)),
-            ("Model change", (prediction - corrupted).abs().div(2).clamp(0, 1)),
+            ("Model change", (prediction - naive_concat).abs().div(2).clamp(0, 1)),
         ]
         labels = [
             f"#{item['dataset_index']} {item['text'][:12]}\n"
@@ -172,8 +177,8 @@ def main() -> None:
     config["data"]["min_text_length"] = max(2, int(config["data"].get("min_text_length", 2)))
     seed_everything(args.seed)
 
-    stage = args.stage or checkpoint.get("stage", "seam")
-    suite = None if stage == "continuation" else args.suite
+    stage = args.stage
+    suite = args.suite
     requested = args.device or config.get("device", "cuda")
     device = torch.device(requested if requested != "cuda" or torch.cuda.is_available() else "cpu")
     model = build_model(config).to(device)
@@ -212,9 +217,10 @@ def main() -> None:
             batch = move_batch(raw_batch, device)
             with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp_enabled):
                 prediction = model(
-                    batch["corrupted"],
-                    batch["corruption_mask"],
-                    batch["edit_mask"],
+                    batch["left_image"],
+                    batch["right_image"],
+                    batch["left_corruption_mask"],
+                    batch["right_corruption_mask"],
                     batch["prefix_context"],
                     batch["prefix_mask"],
                 )

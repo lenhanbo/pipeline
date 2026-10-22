@@ -61,13 +61,12 @@ class AnalyzeMergerTests(unittest.TestCase):
                     "transformer_ffn_dim": 64,
                     "prefix_transformer_layers": 1,
                     "dropout": 0.0,
-                    "residual_scale": 2.0,
                 },
                 "training": {"batch_size": 2, "num_workers": 0},
             }
             checkpoint = root / "checkpoint.pth"
             torch.save(
-                {"model": build_model(config).state_dict(), "config": config, "stage": "seam", "step": 1},
+                {"model": build_model(config).state_dict(), "config": config, "stage": "merge", "step": 1},
                 checkpoint,
             )
             output = root / "analysis"
@@ -76,7 +75,7 @@ class AnalyzeMergerTests(unittest.TestCase):
                     sys.executable,
                     "analyze_merger.py",
                     "--checkpoint", str(checkpoint),
-                    "--stage", "seam",
+                    "--stage", "merge",
                     "--suite", "clean",
                     "--selection", "worst_noise",
                     "--candidate-samples", "3",

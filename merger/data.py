@@ -23,17 +23,6 @@ class CorruptionConfig:
     edit_width: int = 32
     center_gap_width: int = 2
     min_side_width: int = 32
-    continuation_rotation_degrees: float = 3.0
-    continuation_translate_x: int = 3
-    continuation_translate_y: int = 2
-    continuation_shear_degrees: float = 2.0
-    continuation_scale_min: float = 0.97
-    continuation_scale_max: float = 1.03
-    continuation_geometry_probability: float = 0.9
-    continuation_noise_probability: float = 0.8
-    continuation_noise_std_min: float = 0.005
-    continuation_noise_std_max: float = 0.04
-    continuation_blur_probability: float = 0.25
     mask_probability: float = 0.8
     rotation_degrees: float = 8.0
     translate_x: int = 6
@@ -205,80 +194,7 @@ def _photometric(right: torch.Tensor, rng: random.Random, generator: torch.Gener
     return image01.mul(2).sub(1)
 
 
-def make_continuation_sample(
-    target: torch.Tensor,
-    valid_width: int,
-    cfg: CorruptionConfig,
-    rng: random.Random,
-    generator: torch.Generator,
-) -> dict[str, torch.Tensor | int | str]:
-    """Create a mild registration-and-denoising task without hiding content."""
-    valid_width = max(1, min(valid_width, cfg.window_width))
-    use_geometry = rng.random() < cfg.continuation_geometry_probability
-    angle = rng.uniform(-cfg.continuation_rotation_degrees, cfg.continuation_rotation_degrees) if use_geometry else 0.0
-    tx = rng.randint(-cfg.continuation_translate_x, cfg.continuation_translate_x) if use_geometry else 0
-    ty = rng.randint(-cfg.continuation_translate_y, cfg.continuation_translate_y) if use_geometry else 0
-    shear = rng.uniform(-cfg.continuation_shear_degrees, cfg.continuation_shear_degrees) if use_geometry else 0.0
-    scale = rng.uniform(cfg.continuation_scale_min, cfg.continuation_scale_max) if use_geometry else 1.0
-
-    cut = cfg.patch_width
-    left_mask = _column_mask(cfg.image_height, cfg.window_width, 0, cut)
-    right_mask = _column_mask(cfg.image_height, cfg.window_width, cut, valid_width)
-    right = target * right_mask + (1.0 - right_mask)
-    image01 = right.add(1).div(2)
-    if rng.random() < cfg.continuation_blur_probability:
-        sigma = rng.uniform(0.2, 0.8)
-        image01 = TF.gaussian_blur(image01, kernel_size=[3, 3], sigma=[sigma, sigma])
-    if rng.random() < cfg.continuation_noise_probability:
-        std = rng.uniform(cfg.continuation_noise_std_min, cfg.continuation_noise_std_max)
-        noise = torch.randn(image01.shape, generator=generator) * std
-        image01 = image01 + noise * right_mask
-    right = image01.clamp(0, 1).mul(2).sub(1)
-    right = right * right_mask + (1.0 - right_mask)
-
-    right = TF.affine(
-        right,
-        angle=angle,
-        translate=[tx, ty],
-        scale=scale,
-        shear=[shear, 0.0],
-        interpolation=InterpolationMode.BILINEAR,
-        fill=1.0,
-        center=[0.5 * (cut + valid_width), cfg.image_height / 2],
-    )
-    warped_right_mask = TF.affine(
-        right_mask,
-        angle=angle,
-        translate=[tx, ty],
-        scale=scale,
-        shear=[shear, 0.0],
-        interpolation=InterpolationMode.NEAREST,
-        fill=0.0,
-        center=[0.5 * (cut + valid_width), cfg.image_height / 2],
-    )
-    corrupted = target.clone()
-    corrupted[..., cut:valid_width] = 1.0
-    corrupted = torch.minimum(corrupted, right)
-
-    valid_mask = _column_mask(cfg.image_height, cfg.window_width, 0, valid_width)
-    edit_mask = valid_mask.clone()  # predict both adjacent patches
-    corruption_mask = torch.maximum(right_mask, warped_right_mask)
-    seam_mask = _column_mask(cfg.image_height, cfg.window_width, cut - 1, cut + 1)
-    left_preservation_mask = left_mask * (1.0 - corruption_mask)
-    return {
-        "target": target,
-        "corrupted": corrupted,
-        "corruption_mask": corruption_mask,
-        "edit_mask": edit_mask,
-        "valid_mask": valid_mask,
-        "left_preservation_mask": left_preservation_mask,
-        "seam_mask": seam_mask,
-        "cut": cut,
-        "corruption_type": "alignment_noise",
-    }
-
-
-def make_seam_sample(
+def make_merge_sample(
     target: torch.Tensor,
     valid_width: int,
     cfg: CorruptionConfig,
@@ -385,7 +301,7 @@ def make_seam_sample(
     left_preservation_mask = left_mask * (1.0 - corruption_mask)
     return {
         "target": target,
-        "corrupted": corrupted,
+        "naive_concat": corrupted,
         "corruption_mask": corruption_mask,
         "edit_mask": edit_mask,
         "valid_mask": valid_mask,
@@ -409,8 +325,8 @@ class IAMMergerDataset(Dataset):
         force_corruption_type: str | None = None,
         min_text_length: int = 2,
     ) -> None:
-        if stage not in {"continuation", "seam"}:
-            raise ValueError("stage must be 'continuation' or 'seam'")
+        if stage != "merge":
+            raise ValueError("stage must be 'merge'")
         self.data_root = Path(data_root)
         self.records = _read_records(self.data_root, gt_file, min_text_length=min_text_length)
         if max_samples:
@@ -436,18 +352,21 @@ class IAMMergerDataset(Dataset):
         target, prefix_context, global_cut = _merge_window(tensor, self.cfg, rng)
         valid_width = self.cfg.window_width
 
-        if self.stage == "continuation":
-            sample = make_continuation_sample(target, valid_width, self.cfg, rng, generator)
-        else:
-            sample = make_seam_sample(
-                target,
-                valid_width,
-                self.cfg,
-                rng,
-                generator,
-                force_type=self.force_corruption_type,
-                cut=self.cfg.patch_width,
-            )
+        sample = make_merge_sample(
+            target,
+            valid_width,
+            self.cfg,
+            rng,
+            generator,
+            force_type=self.force_corruption_type,
+            cut=self.cfg.patch_width,
+        )
+        # The model receives two independent character images. The combined
+        # tensor remains available only as a target/baseline visualization.
+        sample["left_image"] = sample["naive_concat"][..., : self.cfg.patch_width]
+        sample["right_image"] = sample["naive_concat"][..., self.cfg.patch_width :]
+        sample["left_corruption_mask"] = sample["corruption_mask"][..., : self.cfg.patch_width]
+        sample["right_corruption_mask"] = sample["corruption_mask"][..., self.cfg.patch_width :]
         sample.update(
             {
                 "path": str(path),
