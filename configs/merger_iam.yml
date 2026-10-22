@@ -9,14 +9,14 @@ data:
   max_val_samples: null
 
 corruption:
-  # VATr generates 16 px of width per character. Merger sees exactly the last
-  # prefix patch plus the newly generated patch: 2 * 16 = 32 px.
-  patch_width: 16
-  window_width: 32
+  # One generated character is a square 32x32 patch. The merger sees the last
+  # prefix character plus the newly generated character: 2 * 32 = 64 px.
+  patch_width: 32
+  window_width: 64
   image_height: 32
-  edit_width: 16
+  edit_width: 32
   center_gap_width: 2
-  min_side_width: 16
+  min_side_width: 32
   # Continuation pretraining keeps all pixels visible. It learns to undo only
   # small geometric misalignment and image noise.
   continuation_rotation_degrees: 3.0
@@ -42,8 +42,8 @@ corruption:
 
 model:
   image_height: 32
-  patch_width: 16
-  window_width: 32
+  patch_width: 32
+  window_width: 64
   vit_patch_size: 4
   embed_dim: 256
   transformer_layers: 6
@@ -59,8 +59,9 @@ loss:
   left_identity_weight: 0.50
 
 training:
-  output_dir: runs/merger_iam
-  # The 32x32 ViT input is small; a larger physical batch keeps a T4 busy.
+  # Keep 32x32-character checkpoints separate from the incompatible 32x16 run.
+  output_dir: runs/merger_32x32
+  # The 32x64 ViT input is small; a larger physical batch keeps a T4 busy.
   # One optimizer update now needs one forward/backward pass instead of two.
   batch_size: 12
   gradient_accumulation: 1

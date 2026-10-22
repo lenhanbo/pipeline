@@ -7,7 +7,7 @@ learns to repair a 32-pixel seam after component-level corruptions. Random
 occlusion is disabled by default; the requested center gap is still removed. It
 does not yet generate characters.
 
-The local merger is a pure residual ViT: it patchifies the `32x32` two-character
+The local merger is a pure residual ViT: it patchifies the `32x64` two-character
 window into `4x4` tokens, prepends the final causal prefix token, and projects
 the output tokens directly back to pixels. There is no U-Net or skip decoder.
 Training intentionally uses only two masked L1 terms: reconstruction against the
@@ -15,12 +15,12 @@ clean target over both patches, and identity against the input over the stable
 part of the left patch. SSIM, Sobel, Charbonnier, boundary, perceptual, GAN, and
 CTC losses are not part of this first baseline.
 
-VATr uses `resolution=16`, so one generated character contributes a `32x16`
-patch. The merger's local image is therefore `32x32`: the last 16 pixels of the
-existing prefix and the new 16-pixel character patch. The crop point is selected
-on the original image first. All pixels before that point form the complete
-prefix. Variable-width prefixes are padded only for batching and split on the
-same 16-pixel character grid used by VATr. Each character patch is encoded into
+This baseline now represents one generated character as a square `32x32` patch.
+The merger's local image is therefore `32x64`: the last 32 pixels of the
+existing prefix and the new 32-pixel character patch. A boundary point is selected
+along the horizontal length of the original image; the full image height is always
+kept. All pixels before that point form the complete prefix. Variable-width prefixes
+are padded only for batching and split on the same 32-pixel character grid. Each character patch is encoded into
 exactly one token, then the ordered token sequence is passed through a causal
 Transformer. The final valid Transformer token is the prefix state used to
 condition the local merger, matching the last-hidden-state idea of a language
@@ -57,14 +57,16 @@ From `pipeline/`:
 python -m unittest tests.test_merger
 python train_merger.py --config configs/merger_iam.yml --stage continuation
 python train_merger.py --config configs/merger_iam.yml --stage seam `
-  --resume runs/merger_iam/continuation/best_ssim.pth
+  --resume runs/merger_32x32/continuation/best_ssim.pth
 python evaluate_merger.py --config configs/merger_iam.yml --stage seam `
-  --checkpoint runs/merger_iam/seam/best_seam.pth
+  --checkpoint runs/merger_32x32/seam/best_seam.pth
 ```
 
 Use `--data-root /kaggle/input/.../iam_dataset` and
-`--output-dir /kaggle/working/merger_iam` on Kaggle. Checkpoints are self-contained
+`--output-dir /kaggle/working/merger_32x32` on Kaggle. Checkpoints are self-contained
 and include the resolved configuration, optimizer, scheduler, scaler, and step.
+Checkpoints from the older `32x16` character-patch layout are shape-incompatible;
+start continuation training from scratch after switching to this configuration.
 
 Evaluation writes fixed preview grids and JSON metrics for clean seams, masks,
 translation, rotation, shear/scale, photometric corruption, and their combination.

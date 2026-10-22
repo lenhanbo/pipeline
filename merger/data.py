@@ -17,12 +17,12 @@ from torchvision.transforms import functional as TF
 
 @dataclass(frozen=True)
 class CorruptionConfig:
-    patch_width: int = 16
-    window_width: int = 32
+    patch_width: int = 32
+    window_width: int = 64
     image_height: int = 32
     edit_width: int = 32
     center_gap_width: int = 2
-    min_side_width: int = 16
+    min_side_width: int = 32
     continuation_rotation_degrees: float = 3.0
     continuation_translate_x: int = 3
     continuation_translate_y: int = 2
@@ -89,7 +89,7 @@ def _merge_window(
         padded[..., : image.size(-1)] = image
         image = padded
 
-    # Simulate the boundary between generated characters: one 16 px VATr patch
+    # Simulate the boundary between generated characters: one 32 px character patch
     # becomes one prefix token, so every cut is patch-aligned.
     cut_patch = rng.randint(1, image.size(-1) // cfg.patch_width - 1)
     global_cut = cut_patch * cfg.patch_width

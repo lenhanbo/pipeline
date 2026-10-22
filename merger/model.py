@@ -24,8 +24,8 @@ class MergerNet(nn.Module):
     def __init__(
         self,
         image_height: int = 32,
-        patch_width: int = 16,
-        window_width: int = 32,
+        patch_width: int = 32,
+        window_width: int = 64,
         vit_patch_size: int = 4,
         embed_dim: int = 256,
         transformer_layers: int = 6,

@@ -48,14 +48,14 @@ class MergerTests(unittest.TestCase):
                     temporary.root, "train_gt.txt", stage, deterministic=True  # type: ignore[attr-defined]
                 )
                 sample = dataset[0]
-                self.assertEqual(sample["target"].shape, (1, 32, 32))
+                self.assertEqual(sample["target"].shape, (1, 32, 64))
                 self.assertEqual(sample["prefix_context"].shape[0:2], (1, 32))
                 self.assertEqual(sample["prefix_context"].shape[-1], sample["global_cut"])
                 for key in ("corruption_mask", "edit_mask", "valid_mask"):
                     self.assertTrue(set(torch.unique(sample[key]).tolist()).issubset({0.0, 1.0}))
                 if stage == "seam":
                     coverage = float(sample["edit_mask"].sum()) / 32
-                    self.assertEqual(coverage, 32)
+                    self.assertEqual(coverage, 64)
                     corruption_coverage = float(sample["corruption_mask"].sum())
                     self.assertLessEqual(corruption_coverage, float(sample["edit_mask"].sum()))
                     self.assertTrue(torch.all(sample["corrupted"][sample["seam_mask"].bool()] == 1.0))
@@ -66,13 +66,13 @@ class MergerTests(unittest.TestCase):
             temporary.cleanup()
 
     def test_forced_rotation_and_mask_keep_shapes(self) -> None:
-        target = torch.ones(1, 32, 32)
-        target[:, 12:20, 4:28] = -1
+        target = torch.ones(1, 32, 64)
+        target[:, 12:20, 4:60] = -1
         cfg = CorruptionConfig()
         for kind in ("rotation", "translation", "shear_scale", "mask", "combined", "clean"):
             sample = make_seam_sample(
                 target,
-                32,
+                64,
                 cfg,
                 __import__("random").Random(7),
                 torch.Generator().manual_seed(7),
@@ -84,15 +84,15 @@ class MergerTests(unittest.TestCase):
             self.assertGreater(float(sample["corruption_mask"][..., cut - 1 : cut + 1].sum()), 0)
 
     def test_continuation_keeps_content_visible_and_uses_mild_geometry(self) -> None:
-        target = torch.ones(1, 32, 32)
-        target[:, 12:20, 4:28] = -1
+        target = torch.ones(1, 32, 64)
+        target[:, 12:20, 4:60] = -1
         cfg = CorruptionConfig(
             continuation_geometry_probability=1.0,
             continuation_noise_probability=1.0,
         )
         sample = make_continuation_sample(
             target,
-            32,
+            64,
             cfg,
             __import__("random").Random(7),
             torch.Generator().manual_seed(7),
@@ -105,7 +105,8 @@ class MergerTests(unittest.TestCase):
 
     def test_model_hard_blend_and_backward(self) -> None:
         model = MergerNet(
-            window_width=32,
+            patch_width=32,
+            window_width=64,
             vit_patch_size=4,
             embed_dim=32,
             transformer_layers=1,
@@ -114,14 +115,14 @@ class MergerTests(unittest.TestCase):
             transformer_ffn_dim=64,
             dropout=0.0,
         )
-        image = torch.rand(2, 1, 32, 32) * 2 - 1
-        prefix = torch.rand(2, 1, 32, 32) * 2 - 1
+        image = torch.rand(2, 1, 32, 64) * 2 - 1
+        prefix = torch.rand(2, 1, 32, 64) * 2 - 1
         prefix_mask = torch.ones_like(prefix)
         corruption = torch.zeros_like(image)
         edit = torch.zeros_like(image)
-        edit[..., 8:24] = 1
+        edit[..., 16:48] = 1
         target = image.clone()
-        target[..., 8:24] = 0
+        target[..., 16:48] = 0
         prediction = model(image, corruption, edit, prefix, prefix_mask)
         self.assertTrue(torch.equal(prediction * (1 - edit), image * (1 - edit)))
         loss, parts = MergerLoss()(
