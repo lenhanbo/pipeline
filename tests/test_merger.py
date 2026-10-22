@@ -35,6 +35,7 @@ class MergerTests(unittest.TestCase):
             relative = f"words/a01/a01-000u/a01-000u-00-0{index}.png"
             image.save(root / relative)
             rows.append(f"{relative}\ttest\n")
+        rows.append(f"{relative}\tx\n")
         (root / "train_gt.txt").write_text("".join(rows), encoding="utf-8")
         (root / "val_gt.txt").write_text("".join(rows), encoding="utf-8")
         temporary.root = root  # type: ignore[attr-defined]
@@ -48,6 +49,7 @@ class MergerTests(unittest.TestCase):
                     temporary.root, "train_gt.txt", stage, deterministic=True  # type: ignore[attr-defined]
                 )
                 sample = dataset[0]
+                self.assertEqual(len(dataset), 4)
                 self.assertEqual(sample["target"].shape, (1, 32, 64))
                 self.assertEqual(sample["prefix_context"].shape[0:2], (1, 32))
                 self.assertEqual(sample["prefix_context"].shape[-1], sample["global_cut"])

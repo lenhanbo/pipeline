@@ -59,6 +59,7 @@ def build_dataset(
         seed=int(config.get("seed", 123456)),
         max_samples=data.get(f"max_{split}_samples"),
         force_corruption_type=force_corruption_type,
+        min_text_length=int(data.get("min_text_length", 2)),
     )
 
 

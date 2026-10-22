@@ -42,7 +42,9 @@ pair requires a real boundary reconstruction.
 
 The configured data root must contain `train_gt.txt`, `val_gt.txt`, and the
 `words/` directory. Ground-truth rows use `relative/image.png<TAB>text`, matching
-the IAM data already present in this workspace.
+the IAM data already present in this workspace. Transcripts containing fewer
+than two non-whitespace characters are excluded from training, validation, and
+checkpoint analysis because they do not define a two-character merge boundary.
 
 The model consumes a grayscale image in `[-1,1]`, a restoration/corruption mask,
 and an edit mask. Continuation uses the whole valid crop as the editable region;
@@ -60,6 +62,9 @@ python train_merger.py --config configs/merger_iam.yml --stage seam `
   --resume runs/merger_32x32/continuation/best_ssim.pth
 python evaluate_merger.py --config configs/merger_iam.yml --stage seam `
   --checkpoint runs/merger_32x32/seam/best_seam.pth
+python analyze_merger.py `
+  --checkpoint runs/merger_32x32/seam/best_seam.pth `
+  --stage seam --suite combined --selection worst_noise
 ```
 
 Use `--data-root /kaggle/input/.../iam_dataset` and
@@ -72,3 +77,10 @@ Evaluation writes fixed preview grids and JSON metrics for clean seams, masks,
 translation, rotation, shear/scale, photometric corruption, and their combination.
 The report also includes percentage improvement over both no-op and edge-copy
 baselines; positive percentages mean the learned merger is better.
+
+`analyze_merger.py` samples a configurable candidate pool from a checkpoint and
+writes labeled preview pages, per-sample metrics in `samples.csv`, and a summary.
+Use `--selection random` with different `--seed` values to inspect different
+examples, or rank failures with `worst_mae`, `worst_seam`, and `worst_noise`.
+The noise ranking measures residual error and false ink only on pixels whose clean
+target is confidently background.

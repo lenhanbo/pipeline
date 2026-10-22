@@ -44,7 +44,11 @@ class CorruptionConfig:
     geometry_identity_probability: float = 0.2
 
 
-def _read_records(data_root: Path, gt_file: str) -> list[tuple[Path, str]]:
+def _read_records(
+    data_root: Path,
+    gt_file: str,
+    min_text_length: int = 2,
+) -> list[tuple[Path, str]]:
     records: list[tuple[Path, str]] = []
     gt_path = data_root / gt_file
     with gt_path.open("r", encoding="utf-8") as stream:
@@ -56,6 +60,8 @@ def _read_records(data_root: Path, gt_file: str) -> list[tuple[Path, str]]:
                 relative, text = raw.split("\t", 1)
             except ValueError as exc:
                 raise ValueError(f"invalid ground-truth line {line_number}: {raw!r}") from exc
+            if sum(not character.isspace() for character in text) < min_text_length:
+                continue
             path = data_root.joinpath(*relative.split("/"))
             records.append((path, text))
     if not records:
@@ -401,11 +407,12 @@ class IAMMergerDataset(Dataset):
         seed: int = 123456,
         max_samples: int | None = None,
         force_corruption_type: str | None = None,
+        min_text_length: int = 2,
     ) -> None:
         if stage not in {"continuation", "seam"}:
             raise ValueError("stage must be 'continuation' or 'seam'")
         self.data_root = Path(data_root)
-        self.records = _read_records(self.data_root, gt_file)
+        self.records = _read_records(self.data_root, gt_file, min_text_length=min_text_length)
         if max_samples:
             self.records = self.records[:max_samples]
         self.stage = stage
