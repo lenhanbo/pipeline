@@ -74,6 +74,6 @@ training:
   eval_every: 500
   validation_batches: 50
   continuation:
-    max_steps: 2000
+    max_steps: 20
   seam:
-    max_steps: 1000
+    max_steps: 10
