@@ -10,8 +10,11 @@ from typing import Any
 import numpy as np
 import torch
 import yaml
+import matplotlib
+
+matplotlib.use("Agg")
+from matplotlib import pyplot as plt
 from torch.utils.data import DataLoader
-from torchvision.utils import make_grid, save_image
 
 from .data import CorruptionConfig, IAMMergerDataset
 from .metrics import compute_metrics, edge_copy_baseline
@@ -69,6 +72,46 @@ def aggregate_metrics(items: list[dict[str, float]]) -> dict[str, float]:
     return {key: sum(item[key] for item in items) / len(items) for key in items[0]}
 
 
+def save_labeled_preview(
+    rows: list[tuple[str, torch.Tensor]],
+    column_labels: list[str],
+    path: Path,
+) -> None:
+    """Save a comparison table whose rows and sample columns are labeled."""
+    if not rows or not column_labels:
+        return
+    columns = min(len(column_labels), rows[0][1].size(0))
+    figure, axes = plt.subplots(
+        len(rows),
+        columns,
+        figsize=(max(6.0, 1.55 * columns), max(8.0, 1.35 * len(rows))),
+        squeeze=False,
+    )
+    for row_index, (row_name, images) in enumerate(rows):
+        images = images[:columns].detach().float().cpu()
+        for column_index in range(columns):
+            axis = axes[row_index, column_index]
+            axis.imshow(images[column_index, 0].numpy(), cmap="gray", vmin=0.0, vmax=1.0)
+            axis.set_xticks([])
+            axis.set_yticks([])
+            if row_index == 0:
+                axis.set_title(column_labels[column_index], fontsize=9)
+            if column_index == 0:
+                axis.set_ylabel(
+                    row_name,
+                    rotation=0,
+                    ha="right",
+                    va="center",
+                    labelpad=12,
+                    fontsize=9,
+                )
+    figure.suptitle("Merger preview: rows = outputs, columns = validation samples", fontsize=12)
+    figure.tight_layout(rect=(0.08, 0.0, 1.0, 0.98), pad=0.5)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(path, dpi=160, bbox_inches="tight")
+    plt.close(figure)
+
+
 def relative_improvement(model: dict[str, float], baseline: dict[str, float]) -> dict[str, float]:
     higher_is_better = {"psnr", "ssim", "ink_precision", "ink_recall", "ink_f1"}
     result = {}
@@ -92,7 +135,8 @@ def evaluate_loader(
     model_metrics: list[dict[str, float]] = []
     noop_metrics: list[dict[str, float]] = []
     edge_metrics: list[dict[str, float]] = []
-    preview = None
+    preview_rows: list[tuple[str, torch.Tensor]] | None = None
+    preview_columns: list[str] = []
     for batch_index, raw_batch in enumerate(loader):
         if max_batches is not None and batch_index >= max_batches:
             break
@@ -134,31 +178,34 @@ def evaluate_loader(
                 batch["seam_mask"],
             )
         )
-        if preview is None:
-            error = (prediction - batch["target"]).abs().clamp(0, 2).sub(1)
-            images = torch.cat(
-                (
-                    batch["target"][:8],
-                    torch.nn.functional.interpolate(
-                        batch["prefix_context"][:8],
-                        size=batch["target"].shape[-2:],
-                        mode="bilinear",
-                        align_corners=False,
-                    ),
-                    batch["corrupted"][:8],
-                    batch["corruption_mask"][:8].mul(2).sub(1),
-                    batch["edit_mask"][:8].mul(2).sub(1),
-                    batch["left_preservation_mask"][:8].mul(2).sub(1),
-                    noop[:8],
-                    edge_baseline[:8],
-                    prediction[:8],
-                    error[:8],
-                )
+        if preview_rows is None:
+            count = min(8, batch["target"].size(0))
+            to_image = lambda value: value[:count].add(1).div(2).clamp(0, 1)
+            prefix = torch.nn.functional.interpolate(
+                batch["prefix_context"][:count],
+                size=batch["target"].shape[-2:],
+                mode="bilinear",
+                align_corners=False,
             )
-            preview = make_grid(images.add(1).div(2), nrow=min(8, batch["target"].size(0)), padding=2, pad_value=0.5)
-    if preview_path is not None and preview is not None:
-        preview_path.parent.mkdir(parents=True, exist_ok=True)
-        save_image(preview, preview_path)
+            preview_rows = [
+                ("Target", to_image(batch["target"])),
+                ("Full prefix (resized)", to_image(prefix)),
+                ("Corrupted input", to_image(batch["corrupted"])),
+                ("Corruption mask", batch["corruption_mask"][:count].clamp(0, 1)),
+                ("Edit mask", batch["edit_mask"][:count].clamp(0, 1)),
+                ("Left preserve mask", batch["left_preservation_mask"][:count].clamp(0, 1)),
+                ("No-op baseline", to_image(noop)),
+                ("Edge-copy baseline", to_image(edge_baseline)),
+                ("Model prediction", to_image(prediction)),
+                ("Absolute error", (prediction[:count] - batch["target"][:count]).abs().div(2).clamp(0, 1)),
+            ]
+            texts = batch.get("text", [])
+            preview_columns = [
+                f"#{index + 1}: {str(texts[index])[:16]}" if index < len(texts) else f"Sample {index + 1}"
+                for index in range(count)
+            ]
+    if preview_path is not None and preview_rows is not None:
+        save_labeled_preview(preview_rows, preview_columns, preview_path)
     model_result = aggregate_metrics(model_metrics)
     noop_result = aggregate_metrics(noop_metrics)
     edge_result = aggregate_metrics(edge_metrics)
