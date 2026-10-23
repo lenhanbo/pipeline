@@ -48,6 +48,7 @@ def build_dataset(
     split: str,
     deterministic: bool,
     force_corruption_type: str | None = None,
+    include_trace: bool = False,
 ) -> IAMMergerDataset:
     data = config["data"]
     return IAMMergerDataset(
@@ -60,6 +61,7 @@ def build_dataset(
         max_samples=data.get(f"max_{split}_samples"),
         force_corruption_type=force_corruption_type,
         min_text_length=int(data.get("min_text_length", 2)),
+        include_trace=include_trace,
     )
 
 
@@ -85,7 +87,7 @@ def save_labeled_preview(
     figure, axes = plt.subplots(
         len(rows),
         columns,
-        figsize=(max(6.0, 1.55 * columns), max(8.0, 1.35 * len(rows))),
+        figsize=(max(7.0, 2.2 * columns), max(8.0, 1.35 * len(rows))),
         squeeze=False,
     )
     for row_index, (row_name, images) in enumerate(rows):
@@ -106,7 +108,7 @@ def save_labeled_preview(
                     labelpad=12,
                     fontsize=9,
                 )
-    figure.suptitle("Merger preview: rows = outputs, columns = validation samples", fontsize=12)
+    figure.suptitle("Merger preview: rows = views, columns = samples", fontsize=12)
     figure.tight_layout(rect=(0.08, 0.0, 1.0, 0.98), pad=0.5)
     path.parent.mkdir(parents=True, exist_ok=True)
     figure.savefig(path, dpi=160, bbox_inches="tight")
@@ -195,6 +197,7 @@ def evaluate_loader(
                 ("Left input", to_image(batch["left_image"])),
                 ("Right input", to_image(batch["right_image"])),
                 ("Naive concatenation", to_image(noop)),
+                ("Boundary erase mask", batch["boundary_erase_mask"][:count].clamp(0, 1)),
                 ("Corruption mask", batch["corruption_mask"][:count].clamp(0, 1)),
                 ("Edit mask", batch["edit_mask"][:count].clamp(0, 1)),
                 ("Left preserve mask", batch["left_preservation_mask"][:count].clamp(0, 1)),

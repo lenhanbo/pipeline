@@ -4,6 +4,7 @@ __pycache__/
 .venv/
 checkpoints/
 outputs/
+runs/
 data/raw/
 data/processed/
 

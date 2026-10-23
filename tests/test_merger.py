@@ -11,6 +11,8 @@ from PIL import Image, ImageDraw
 from merger.data import (
     CorruptionConfig,
     IAMMergerDataset,
+    _content_preserving_affine,
+    _merge_window,
     make_merge_sample,
     merger_collate,
 )
@@ -59,17 +61,19 @@ class MergerTests(unittest.TestCase):
                     )
                 )
                 self.assertEqual(sample["prefix_context"].shape[0:2], (1, 32))
-                self.assertEqual(sample["prefix_context"].shape[-1], sample["global_cut"])
+                self.assertEqual(sample["prefix_valid_width"], sample["global_cut"])
+                self.assertGreaterEqual(sample["prefix_context"].shape[-1], sample["global_cut"])
+                self.assertEqual(sample["prefix_context"].shape[-1] % 32, 0)
                 for key in ("corruption_mask", "edit_mask", "valid_mask"):
                     self.assertTrue(set(torch.unique(sample[key]).tolist()).issubset({0.0, 1.0}))
                 coverage = float(sample["edit_mask"].sum()) / 32
                 self.assertEqual(coverage, 64)
                 corruption_coverage = float(sample["corruption_mask"].sum())
                 self.assertLessEqual(corruption_coverage, float(sample["edit_mask"].sum()))
-                self.assertTrue(torch.all(sample["naive_concat"][sample["seam_mask"].bool()] == 1.0))
-                self.assertEqual(
-                    float((sample["left_preservation_mask"] * sample["seam_mask"]).sum()), 0.0
-                )
+                self.assertTrue(torch.equal(sample["left_image"], sample["target"][..., :32]))
+                self.assertGreater(float((sample["right_image"] == 1.0).sum()), 0)
+                self.assertGreaterEqual(float((sample["target"][..., :32] < 0.9).sum()), 8)
+                self.assertGreaterEqual(float((sample["target"][..., 32:] < 0.9).sum()), 8)
         finally:
             temporary.cleanup()
 
@@ -88,8 +92,77 @@ class MergerTests(unittest.TestCase):
             )
             self.assertEqual(sample["naive_concat"].shape, target.shape)
             self.assertTrue(set(torch.unique(sample["corruption_mask"]).tolist()).issubset({0.0, 1.0}))
-            cut = int(sample["cut"])
-            self.assertGreater(float(sample["corruption_mask"][..., cut - 1 : cut + 1].sum()), 0)
+            self.assertGreater(float((sample["right_image"] < 0.9).sum()), 0)
+            if kind == "mask":
+                self.assertEqual(float(sample["boundary_erase_mask"].sum()), 32 * 2)
+                self.assertTrue(
+                    torch.all(sample["right_image"][sample["boundary_erase_mask"].bool()] == 1.0)
+                )
+
+    def test_augmentation_does_not_tint_empty_background(self) -> None:
+        target = torch.ones(1, 32, 64)
+        cfg = CorruptionConfig(boundary_erase_probability=0.0)
+        for kind in ("rotation", "translation", "shear_scale", "photometric", "combined"):
+            sample = make_merge_sample(
+                target,
+                64,
+                cfg,
+                __import__("random").Random(11),
+                torch.Generator().manual_seed(11),
+                force_type=kind,
+            )
+            self.assertTrue(torch.equal(sample["right_image"], torch.ones(1, 32, 32)))
+
+    def test_affine_keeps_all_compact_ink_inside_right_patch(self) -> None:
+        target = torch.ones(1, 32, 64)
+        target[:, 10:22, 38:58] = -1
+        cfg = CorruptionConfig(boundary_erase_probability=0.0)
+        original_ink = float(target[..., 32:].lt(0.9).sum())
+        for kind in ("rotation", "translation", "shear_scale"):
+            sample = make_merge_sample(
+                target,
+                64,
+                cfg,
+                __import__("random").Random(7),
+                torch.Generator().manual_seed(7),
+                force_type=kind,
+            )
+            transformed_ink = float(sample["right_image"].lt(0.9).sum())
+            # Bilinear interpolation changes edge pixels, but the padded affine
+            # and fit-back step must retain the complete stroke body.
+            self.assertGreater(transformed_ink, 0.70 * original_ink)
+
+    def test_window_sampling_is_centered_and_keeps_ink_in_both_halves(self) -> None:
+        image = torch.ones(1, 32, 256)
+        image[:, 12:20, 32:224] = -1
+        cfg = CorruptionConfig()
+        starts = []
+        for seed in range(200):
+            target, _, global_cut, _ = _merge_window(
+                image, cfg, __import__("random").Random(seed)
+            )
+            starts.append(global_cut - cfg.patch_width)
+            self.assertGreaterEqual(float((target[..., :32] < 0.9).sum()), 8)
+            self.assertGreaterEqual(float((target[..., 32:] < 0.9).sum()), 8)
+        expected_center = (image.size(-1) - cfg.window_width) / 2
+        self.assertLess(abs(sum(starts) / len(starts) - expected_center), 5.0)
+        self.assertGreater(sum(48 <= start <= 144 for start in starts), 140)
+
+    def test_right_patch_translation_is_not_canceled_by_fit_back(self) -> None:
+        right = torch.ones(1, 32, 32)
+        right[:, 8:24, 10:18] = -1
+        centered = _content_preserving_affine(
+            right, angle=0, tx=0, ty=0, scale=1, shear=0, margin_x=6, margin_y=4
+        )
+        shifted = _content_preserving_affine(
+            right, angle=0, tx=5, ty=0, scale=1, shear=0, margin_x=6, margin_y=4
+        )
+
+        def ink_center_x(image: torch.Tensor) -> float:
+            points = torch.nonzero(image[0] < 0.9, as_tuple=False)
+            return float(points[:, 1].float().mean())
+
+        self.assertGreater(ink_center_x(shifted) - ink_center_x(centered), 3.5)
 
     def test_model_generates_full_merge_and_backward(self) -> None:
         model = MergerNet(
@@ -147,7 +220,7 @@ class MergerTests(unittest.TestCase):
             )
             batch = merger_collate([dataset[0], dataset[1]])
             self.assertEqual(batch["prefix_context"].shape, batch["prefix_mask"].shape)
-            for index, width in enumerate(batch["global_cut"].tolist()):
+            for index, width in enumerate(batch["prefix_valid_width"].tolist()):
                 self.assertTrue(torch.all(batch["prefix_mask"][index, ..., :width] == 1))
                 self.assertTrue(torch.all(batch["prefix_mask"][index, ..., width:] == 0))
         finally:

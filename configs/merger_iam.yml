@@ -16,11 +16,17 @@ corruption:
   patch_width: 32
   window_width: 64
   image_height: 32
-  edit_width: 32
   center_gap_width: 2
-  min_side_width: 32
-  # No random occlusion; merge augmentation still removes the center join.
-  mask_probability: 0.0
+  # Sample 64px windows from a truncated normal distribution around the word
+  # center, retrying until both 32px halves contain visible handwriting.
+  window_center_std_fraction: 0.18
+  window_sample_attempts: 16
+  record_sample_attempts: 8
+  min_half_ink_pixels: 8
+  # Optionally whiten a full-height strip at the left edge of the right patch
+  # before centering and geometry. Width 2 means columns 0 and 1 are removed.
+  boundary_erase_probability: 0.60
+  boundary_erase_width: 2
   rotation_degrees: 8.0
   translate_x: 6
   translate_y: 4
@@ -28,6 +34,15 @@ corruption:
   scale_min: 0.90
   scale_max: 1.10
   geometry_identity_probability: 0.20
+  # No blur, contrast jitter, or morphology in the first baseline. Add only
+  # mild Gaussian noise on ink pixels so the white paper stays unchanged.
+  noise_probability: 0.30
+  noise_std_min: 0.005
+  noise_std_max: 0.025
+  # Simulate an independently generated character centered in its own patch.
+  # These margins leave room for the right patch to move visibly after affine.
+  standalone_margin_x: 6
+  standalone_margin_y: 4
 
 model:
   image_height: 32

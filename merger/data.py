@@ -20,10 +20,13 @@ class CorruptionConfig:
     patch_width: int = 32
     window_width: int = 64
     image_height: int = 32
-    edit_width: int = 32
     center_gap_width: int = 2
-    min_side_width: int = 32
-    mask_probability: float = 0.8
+    window_center_std_fraction: float = 0.18
+    window_sample_attempts: int = 16
+    record_sample_attempts: int = 8
+    min_half_ink_pixels: int = 8
+    boundary_erase_probability: float = 0.6
+    boundary_erase_width: int = 2
     rotation_degrees: float = 8.0
     translate_x: int = 6
     translate_y: int = 4
@@ -31,6 +34,11 @@ class CorruptionConfig:
     scale_min: float = 0.9
     scale_max: float = 1.1
     geometry_identity_probability: float = 0.2
+    noise_probability: float = 0.30
+    noise_std_min: float = 0.005
+    noise_std_max: float = 0.025
+    standalone_margin_x: int = 6
+    standalone_margin_y: int = 4
 
 
 def _read_records(
@@ -63,38 +71,72 @@ def _to_normalized_tensor(image: Image.Image, height: int) -> torch.Tensor:
     width = max(1, round(image.width * height / image.height))
     image = image.resize((width, height), Image.Resampling.BILINEAR)
     array = np.asarray(image, dtype=np.float32) / 255.0
+    # Estimate paper and foreground once on the complete word, before choosing
+    # the 64px window. Otsu separates dark handwriting from scanner/paper tone;
+    # the small margin retains antialiased stroke edges. Values above the cutoff
+    # become exact white in both halves, so geometry cannot rotate a gray paper
+    # rectangle into only the right input.
+    paper = max(float(np.percentile(array, 95)), 0.5)
+    array = np.clip(array / paper, 0.0, 1.0)
+    histogram, _ = np.histogram(array, bins=256, range=(0.0, 1.0))
+    probabilities = histogram.astype(np.float64) / max(int(histogram.sum()), 1)
+    cumulative_probability = np.cumsum(probabilities)
+    cumulative_mean = np.cumsum(probabilities * np.arange(256, dtype=np.float64))
+    total_mean = cumulative_mean[-1]
+    variance = (total_mean * cumulative_probability - cumulative_mean) ** 2
+    variance /= cumulative_probability * (1.0 - cumulative_probability) + 1e-12
+    otsu = float(np.argmax(variance)) / 255.0
+    paper_cutoff = min(0.95, max(0.35, otsu + 0.12))
+    array = np.clip(array / paper_cutoff, 0.0, 1.0)
     return torch.from_numpy(array).unsqueeze(0).mul(2.0).sub(1.0)
 
 
 def _merge_window(
     image: torch.Tensor, cfg: CorruptionConfig, rng: random.Random
-) -> tuple[torch.Tensor, torch.Tensor, int]:
-    """Return [last prefix patch | next patch] and the complete raw prefix."""
+) -> tuple[torch.Tensor, torch.Tensor, int, int]:
+    """Sample a horizontal 64-pixel interval and retain the complete prefix."""
     expected_width = 2 * cfg.patch_width
     if cfg.window_width != expected_width:
         raise ValueError(
             f"window_width must equal 2 * patch_width ({expected_width}), got {cfg.window_width}"
         )
-    padded_width = max(
-        expected_width,
-        math.ceil(image.size(-1) / cfg.patch_width) * cfg.patch_width,
-    )
+    padded_width = max(expected_width, image.size(-1))
     if image.size(-1) != padded_width:
         padded = torch.ones((1, image.size(-2), padded_width), dtype=image.dtype)
         padded[..., : image.size(-1)] = image
         image = padded
 
-    # Simulate the boundary between generated characters: one 32 px character patch
-    # becomes one prefix token, so every cut is patch-aligned.
-    cut_patch = rng.randint(1, image.size(-1) // cfg.patch_width - 1)
-    global_cut = cut_patch * cfg.patch_width
-    start = global_cut - cfg.patch_width
+    max_start = image.size(-1) - cfg.window_width
+    center_start = max_start / 2.0
+    start_std = max(1.0, max_start * cfg.window_center_std_fraction)
+    start = int(round(center_start))
+    best_score = -1
+    # Draw from a truncated normal distribution around the word center. A draw
+    # is accepted only when both 32px halves contain ink; otherwise retain the
+    # best candidate seen so words with an unavoidable blank half still work.
+    for _ in range(max(1, cfg.window_sample_attempts)):
+        candidate = round(rng.gauss(center_start, start_std)) if max_start else 0
+        candidate = min(max(int(candidate), 0), max_start)
+        window = image[..., candidate : candidate + cfg.window_width]
+        left_ink = int((window[..., : cfg.patch_width] < 0.9).sum())
+        right_ink = int((window[..., cfg.patch_width :] < 0.9).sum())
+        score = min(left_ink, right_ink)
+        if score > best_score:
+            start, best_score = candidate, score
+        if score >= cfg.min_half_ink_pixels:
+            start = candidate
+            break
+    global_cut = start + cfg.patch_width
     target = image[..., start : start + cfg.window_width]
 
     # Do not pool pixels here. The model must encode the complete prefix first,
     # then pool its feature sequence (the same ordering used by an LM encoder).
-    full_prefix = image[..., :global_cut]
-    return target, full_prefix, global_cut
+    raw_prefix = image[..., :global_cut]
+    prefix_valid_width = raw_prefix.size(-1)
+    prefix_width = math.ceil(prefix_valid_width / cfg.patch_width) * cfg.patch_width
+    full_prefix = image.new_ones((1, cfg.image_height, prefix_width))
+    full_prefix[..., :prefix_valid_width] = raw_prefix
+    return target, full_prefix, global_cut, prefix_valid_width
 
 
 def merger_collate(samples: list[dict[str, Any]]) -> dict[str, Any]:
@@ -109,8 +151,9 @@ def merger_collate(samples: list[dict[str, Any]]) -> dict[str, Any]:
     prefix_mask = contexts[0].new_zeros(batch_context.shape)
     for index, context in enumerate(contexts):
         width = context.size(-1)
+        valid_width = int(samples[index]["prefix_valid_width"])
         batch_context[index, :, :, :width] = context
-        prefix_mask[index, :, :, :width] = 1.0
+        prefix_mask[index, :, :, :valid_width] = 1.0
 
     fixed = [{key: value for key, value in sample.items() if key != "prefix_context"} for sample in samples]
     batch = default_collate(fixed)
@@ -125,73 +168,159 @@ def _column_mask(height: int, width: int, start: int, end: int) -> torch.Tensor:
     return mask
 
 
-def _draw_occlusions(
-    mask: torch.Tensor,
-    left: int,
-    right: int,
+def _photometric(
+    right: torch.Tensor,
+    cfg: CorruptionConfig,
     rng: random.Random,
-) -> None:
-    height = mask.size(-2)
-    region_width = max(1, right - left)
-    target = rng.uniform(0.10, 0.35) * height * region_width
-    covered_before = float(mask[..., left:right].sum())
-
-    if rng.random() < 0.7:
-        band_width = rng.randint(2, min(8, region_width))
-        center = rng.randint(left, max(left, right - 1))
-        mask[..., max(left, center - band_width // 2) : min(right, center + math.ceil(band_width / 2))] = 1
-
-    for _ in range(rng.randint(1, 3)):
-        rect_width = rng.randint(2, min(12, region_width))
-        rect_height = rng.randint(4, min(16, height))
-        x0 = rng.randint(left, max(left, right - rect_width))
-        y0 = rng.randint(0, height - rect_height)
-        mask[..., y0 : y0 + rect_height, x0 : x0 + rect_width] = 1
-        if float(mask[..., left:right].sum()) - covered_before >= target:
-            break
-
-    if rng.random() < 0.35:
-        thickness = rng.randint(1, 3)
-        x0 = rng.randint(left, max(left, right - 1))
-        slope = rng.uniform(-0.4, 0.4)
-        for y in range(height):
-            x = round(x0 + slope * (y - height / 2))
-            mask[..., y, max(left, x - thickness) : min(right, x + thickness + 1)] = 1
-
-    region = mask[..., left:right]
-    while float(region.sum()) - covered_before < target:
-        rect_width = rng.randint(2, min(6, region_width))
-        rect_height = rng.randint(2, min(8, height))
-        x0 = rng.randint(0, max(0, region_width - rect_width))
-        y0 = rng.randint(0, height - rect_height)
-        region[..., y0 : y0 + rect_height, x0 : x0 + rect_width] = 1
-    max_pixels = int(0.5 * height * region_width)
-    if int(region.sum()) > max_pixels:
-        indices = torch.nonzero(region[0], as_tuple=False).tolist()
-        rng.shuffle(indices)
-        for y, x in indices[max_pixels:]:
-            region[0, y, x] = 0
+    generator: torch.Generator,
+) -> torch.Tensor:
+    # Work on ink opacity rather than image brightness. Zero ink stays exactly
+    # zero, so augmentation can never introduce a mismatched gray background.
+    ink = right.neg().add(1).div(2).clamp(0, 1)
+    if rng.random() < cfg.noise_probability:
+        support = (ink > 0.01).float()
+        noise = torch.randn(ink.shape, generator=generator) * rng.uniform(
+            cfg.noise_std_min, cfg.noise_std_max
+        )
+        ink = (ink + noise * support).clamp(0, 1)
+    return 1.0 - 2.0 * ink.clamp(0, 1)
 
 
-def _photometric(right: torch.Tensor, rng: random.Random, generator: torch.Generator) -> torch.Tensor:
-    image01 = right.add(1).div(2)
-    contrast = rng.uniform(0.8, 1.2)
-    brightness = rng.uniform(-0.08, 0.08)
-    image01 = ((image01 - 0.5) * contrast + 0.5 + brightness).clamp(0, 1)
-    if rng.random() < 0.35:
-        sigma = rng.uniform(0.2, 1.0)
-        image01 = TF.gaussian_blur(image01, kernel_size=[3, 3], sigma=[sigma, sigma])
-    if rng.random() < 0.35:
-        noise = torch.randn(image01.shape, generator=generator) * rng.uniform(0.005, 0.035)
-        image01 = (image01 + noise).clamp(0, 1)
-    if rng.random() < 0.25:
-        ink = 1.0 - image01
-        if rng.random() < 0.5:
-            ink = torch.nn.functional.max_pool2d(ink.unsqueeze(0), 3, 1, 1).squeeze(0)
-        else:
-            ink = -torch.nn.functional.max_pool2d(-ink.unsqueeze(0), 3, 1, 1).squeeze(0)
-        image01 = 1.0 - ink
-    return image01.mul(2).sub(1)
+def _ink_bbox(ink: torch.Tensor, threshold: float = 1e-4) -> tuple[int, int, int, int] | None:
+    points = torch.nonzero(ink[0] > threshold, as_tuple=False)
+    if points.numel() == 0:
+        return None
+    y0, x0 = points.amin(dim=0).tolist()
+    y1, x1 = (points.amax(dim=0) + 1).tolist()
+    return int(y0), int(y1), int(x0), int(x1)
+
+
+def _erase_boundary_columns(
+    right: torch.Tensor,
+    cfg: CorruptionConfig,
+    rng: random.Random,
+    force: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    erase_mask = torch.zeros_like(right)
+    if not force and rng.random() >= cfg.boundary_erase_probability:
+        return right, erase_mask
+    width = min(max(0, cfg.boundary_erase_width), right.size(-1))
+    erase_mask[..., :width] = 1.0
+    erased = right.clone()
+    erased[erase_mask.bool()] = 1.0
+    return erased, erase_mask
+
+
+def _center_standalone_patch(
+    right: torch.Tensor,
+    margin_x: int,
+    margin_y: int,
+) -> torch.Tensor:
+    """Fit the right-side ink into a centered standalone 32px patch."""
+    height, width = right.shape[-2:]
+    ink = right.neg().add(1).div(2).clamp(0, 1)
+    source_bbox = _ink_bbox(ink, threshold=0.01)
+    if source_bbox is None:
+        return torch.ones_like(right)
+    source_y0, source_y1, source_x0, source_x1 = source_bbox
+    content = ink[..., source_y0:source_y1, source_x0:source_x1]
+
+    # A generated character patch is normally centered rather than already in
+    # its final word position. Reserve explicit margins before affine so x/y
+    # translation remains visible instead of being canceled by fit-back.
+    available_height = max(1, height - 2 * max(0, margin_y))
+    available_width = max(1, width - 2 * max(0, margin_x))
+    content_height, content_width = content.shape[-2:]
+    if content_height > available_height or content_width > available_width:
+        factor = min(available_height / content_height, available_width / content_width)
+        content_height = max(1, round(content_height * factor))
+        content_width = max(1, round(content_width * factor))
+        content = torch.nn.functional.interpolate(
+            content.unsqueeze(0),
+            size=(content_height, content_width),
+            mode="bilinear",
+            align_corners=False,
+            antialias=True,
+        ).squeeze(0)
+    output_ink = torch.zeros_like(ink)
+    paste_y = (height - content_height) // 2
+    paste_x = (width - content_width) // 2
+    output_ink[..., paste_y : paste_y + content_height, paste_x : paste_x + content_width] = content
+    return 1.0 - 2.0 * output_ink.clamp(0, 1)
+
+
+def _affine_centered_patch(
+    centered_right: torch.Tensor,
+    angle: float,
+    tx: int,
+    ty: int,
+    scale: float,
+    shear: float,
+) -> torch.Tensor:
+    """Affine an already centered patch on a padded canvas without clipping."""
+    height, width = centered_right.shape[-2:]
+    padding = max(height, width)
+    canvas = centered_right.new_zeros((1, height + 2 * padding, width + 2 * padding))
+    ink = centered_right.neg().add(1).div(2).clamp(0, 1)
+    canvas[..., padding : padding + height, padding : padding + width] = ink
+    warped = TF.affine(
+        canvas,
+        angle=angle,
+        translate=[tx, ty],
+        scale=scale,
+        shear=[shear, 0.0],
+        interpolation=InterpolationMode.BILINEAR,
+        fill=0.0,
+        center=[canvas.size(-1) / 2, canvas.size(-2) / 2],
+    )
+    bbox = _ink_bbox(warped, threshold=0.01)
+    if bbox is None:
+        return torch.ones_like(centered_right)
+    y0, y1, x0, x1 = bbox
+    content = warped[..., y0:y1, x0:x1]
+    content_height, content_width = content.shape[-2:]
+    if content_height > height or content_width > width:
+        factor = min(height / content_height, width / content_width)
+        resized_height = max(1, min(height, round(content_height * factor)))
+        resized_width = max(1, min(width, round(content_width * factor)))
+        content = torch.nn.functional.interpolate(
+            content.unsqueeze(0),
+            size=(resized_height, resized_width),
+            mode="bilinear",
+            align_corners=False,
+            antialias=True,
+        ).squeeze(0)
+        content_height, content_width = content.shape[-2:]
+
+    center_y = 0.5 * (y0 + y1) - padding
+    center_x = 0.5 * (x0 + x1) - padding
+    paste_y = min(max(round(center_y - content_height / 2), 0), height - content_height)
+    paste_x = min(max(round(center_x - content_width / 2), 0), width - content_width)
+    output_ink = torch.zeros_like(ink)
+    output_ink[..., paste_y : paste_y + content_height, paste_x : paste_x + content_width] = content
+    return 1.0 - 2.0 * output_ink.clamp(0, 1)
+
+
+def _content_preserving_affine(
+    right: torch.Tensor,
+    angle: float,
+    tx: int,
+    ty: int,
+    scale: float,
+    shear: float,
+    margin_x: int,
+    margin_y: int,
+) -> torch.Tensor:
+    """Center a standalone patch, transform it, and retain every ink pixel."""
+    centered = _center_standalone_patch(right, margin_x=margin_x, margin_y=margin_y)
+    return _affine_centered_patch(
+        centered,
+        angle=angle,
+        tx=tx,
+        ty=ty,
+        scale=scale,
+        shear=shear,
+    )
 
 
 def make_merge_sample(
@@ -202,29 +331,40 @@ def make_merge_sample(
     generator: torch.Generator,
     force_type: str | None = None,
     cut: int | None = None,
+    include_trace: bool = False,
 ) -> dict[str, torch.Tensor | int | str]:
-    min_side = min(cfg.min_side_width, max(1, valid_width // 3))
-    cut = cut if cut is not None else rng.randint(min_side, max(min_side, valid_width - min_side))
+    cut = cut if cut is not None else cfg.patch_width
+    if cut != cfg.patch_width or valid_width != cfg.window_width:
+        raise ValueError("merge samples must be two equal patches split at the center")
     valid_mask = _column_mask(cfg.image_height, cfg.window_width, 0, valid_width)
-    edit_mask = valid_mask.clone()  # both patches are predicted and may be adjusted
-    half_edit = cfg.edit_width // 2
-    edit_left, edit_right = max(0, cut - half_edit), min(valid_width, cut + half_edit)
+    edit_mask = valid_mask.clone()
     left_mask = _column_mask(cfg.image_height, cfg.window_width, 0, cut)
 
     allowed = {"clean", "rotation", "translation", "shear_scale", "photometric", "mask", "combined"}
     corruption_type = force_type or "combined"
     if corruption_type not in allowed:
         raise ValueError(f"unknown corruption type: {corruption_type}")
-    right = torch.ones_like(target)
-    right[..., cut:valid_width] = target[..., cut:valid_width]
+    left_image = target[..., :cut].clone()
+    clean_right = target[..., cut:valid_width].clone()
+    right_image = clean_right.clone()
+
+    erase_boundary = corruption_type == "mask" or corruption_type == "combined"
+    if erase_boundary:
+        right_image, boundary_erase_mask = _erase_boundary_columns(
+            right_image,
+            cfg,
+            rng,
+            force=corruption_type == "mask",
+        )
+    else:
+        boundary_erase_mask = torch.zeros_like(right_image)
+    right_after_boundary_erase = right_image.clone()
+
     if corruption_type in {"photometric", "combined"}:
-        right = _photometric(right, rng, generator)
-        # Photometric changes belong to the candidate/right component only;
-        # otherwise a brightness offset would tint the preserved prefix too.
-        component_mask = _column_mask(cfg.image_height, cfg.window_width, cut, valid_width)
-        right = right * component_mask + (1.0 - component_mask)
+        right_image = _photometric(right_image, cfg, rng, generator)
+    right_after_photometric = right_image.clone()
     use_geometry = corruption_type not in {"clean", "photometric", "mask"}
-    identity = rng.random() < cfg.geometry_identity_probability
+    identity = corruption_type == "combined" and rng.random() < cfg.geometry_identity_probability
     angle = 0.0 if identity or not use_geometry else rng.uniform(-cfg.rotation_degrees, cfg.rotation_degrees)
     tx = 0 if identity or not use_geometry else rng.randint(-cfg.translate_x, cfg.translate_x)
     ty = 0 if identity or not use_geometry else rng.randint(-cfg.translate_y, cfg.translate_y)
@@ -238,78 +378,88 @@ def make_merge_sample(
     elif corruption_type == "shear_scale":
         angle, tx, ty = 0.0, 0, 0
 
-    right_valid = _column_mask(cfg.image_height, cfg.window_width, cut, valid_width)
     if use_geometry:
-        center = [0.5 * (cut + valid_width), cfg.image_height / 2]
-        right = TF.affine(
-            right,
-            angle=angle,
-            translate=[tx, ty],
-            scale=scale,
-            shear=[shear, 0.0],
-            interpolation=InterpolationMode.BILINEAR,
-            fill=1.0,
-            center=center,
+        right_centered = _center_standalone_patch(
+            right_image,
+            margin_x=cfg.standalone_margin_x,
+            margin_y=cfg.standalone_margin_y,
         )
-        warped_valid = TF.affine(
-            right_valid,
+        right_image = _affine_centered_patch(
+            right_centered,
             angle=angle,
-            translate=[tx, ty],
+            tx=tx,
+            ty=ty,
             scale=scale,
-            shear=[shear, 0.0],
-            interpolation=InterpolationMode.NEAREST,
-            fill=0.0,
-            center=center,
+            shear=shear,
         )
+        if include_trace:
+            right_rotation_only = _affine_centered_patch(
+                right_centered,
+                angle=angle,
+                tx=0,
+                ty=0,
+                scale=1.0,
+                shear=0.0,
+            )
+            right_before_translation = _affine_centered_patch(
+                right_centered,
+                angle=angle,
+                tx=0,
+                ty=0,
+                scale=scale,
+                shear=shear,
+            )
     else:
-        warped_valid = right_valid
+        right_centered = right_image.clone()
+        right_rotation_only = right_image.clone()
+        right_before_translation = right_image.clone()
 
-    corrupted = target.clone()
-    corrupted[..., cut:valid_width] = 1.0
-    corrupted = torch.minimum(corrupted, right)
-    corruption_mask = torch.maximum(right_valid, warped_valid)
-
-    # Always remove a minimal vertical seam after splitting. This prevents the
-    # network from solving seam restoration by simply copying two already
-    # connected halves. With width=2, one column is removed on each side.
-    gap_width = max(1, cfg.center_gap_width)
-    gap_left = max(edit_left, cut - gap_width // 2)
-    gap_right = min(edit_right, gap_left + gap_width)
-    center_gap = _column_mask(cfg.image_height, cfg.window_width, gap_left, gap_right) * valid_mask
-    overlap = warped_valid * left_mask
-    seam_removal = torch.maximum(center_gap, overlap)
-    corrupted[seam_removal.bool()] = 1.0
-    corruption_mask = torch.maximum(corruption_mask, seam_removal)
-
-    add_mask = corruption_type == "mask" or (
-        corruption_type == "combined" and rng.random() < cfg.mask_probability
+    left_corruption_mask = torch.zeros_like(left_image)
+    right_corruption_mask = ((right_image - clean_right).abs() > 1e-4).float()
+    naive_concat = torch.cat((left_image, right_image), dim=-1)
+    corruption_mask = torch.cat((left_corruption_mask, right_corruption_mask), dim=-1)
+    join_width = max(1, cfg.center_gap_width)
+    join_left = cut - join_width // 2
+    join_mask = _column_mask(
+        cfg.image_height,
+        cfg.window_width,
+        join_left,
+        join_left + join_width,
     )
-    if add_mask:
-        occlusion = torch.zeros_like(target)
-        _draw_occlusions(occlusion, edit_left, edit_right, rng)
-        occlusion *= valid_mask
-        corrupted[occlusion.bool()] = 1.0
-        corruption_mask = torch.maximum(corruption_mask, occlusion)
-
-    if corruption_type == "clean":
-        # Clean-seam keeps the mandatory center gap but disables all other
-        # perturbations, making it a focused boundary-repair evaluation.
-        corrupted = target.clone()
-        corrupted[center_gap.bool()] = 1.0
-        corruption_mask = center_gap
-        seam_removal = center_gap
-    left_preservation_mask = left_mask * (1.0 - corruption_mask)
-    return {
+    left_preservation_mask = left_mask
+    sample: dict[str, torch.Tensor | int | str] = {
         "target": target,
-        "naive_concat": corrupted,
+        "left_image": left_image,
+        "right_image": right_image,
+        "left_corruption_mask": left_corruption_mask,
+        "right_corruption_mask": right_corruption_mask,
+        "boundary_erase_mask": boundary_erase_mask,
+        "naive_concat": naive_concat,
         "corruption_mask": corruption_mask,
         "edit_mask": edit_mask,
         "valid_mask": valid_mask,
         "left_preservation_mask": left_preservation_mask,
-        "seam_mask": seam_removal,
+        "seam_mask": join_mask,
         "cut": cut,
+        "angle": angle,
+        "translate_x": tx,
+        "translate_y": ty,
+        "scale": scale,
+        "shear": shear,
         "corruption_type": corruption_type,
     }
+    if include_trace:
+        sample.update(
+            {
+                "trace_clean_right": clean_right,
+                "trace_after_boundary_erase": right_after_boundary_erase,
+                "trace_after_photometric": right_after_photometric,
+                "trace_centered_right": right_centered,
+                "trace_rotation_only": right_rotation_only,
+                "trace_before_translation": right_before_translation,
+            }
+        )
+    return sample
 
 
 class IAMMergerDataset(Dataset):
@@ -324,6 +474,7 @@ class IAMMergerDataset(Dataset):
         max_samples: int | None = None,
         force_corruption_type: str | None = None,
         min_text_length: int = 2,
+        include_trace: bool = False,
     ) -> None:
         if stage != "merge":
             raise ValueError("stage must be 'merge'")
@@ -336,6 +487,7 @@ class IAMMergerDataset(Dataset):
         self.deterministic = deterministic
         self.seed = seed
         self.force_corruption_type = force_corruption_type
+        self.include_trace = include_trace
 
     def __len__(self) -> int:
         return len(self.records)
@@ -346,10 +498,47 @@ class IAMMergerDataset(Dataset):
 
     def __getitem__(self, index: int) -> dict[str, Any]:
         rng, generator = self._rng(index)
-        path, text = self.records[index]
-        with Image.open(path) as image:
-            tensor = _to_normalized_tensor(image, self.cfg.image_height)
-        target, prefix_context, global_cut = _merge_window(tensor, self.cfg, rng)
+        best: tuple[
+            int, Path, str, torch.Tensor, torch.Tensor, torch.Tensor, int, int
+        ] | None = None
+        best_score = -1
+        for attempt in range(max(1, self.cfg.record_sample_attempts)):
+            record_index = index if attempt == 0 else rng.randrange(len(self.records))
+            path, text = self.records[record_index]
+            with Image.open(path) as image:
+                tensor = _to_normalized_tensor(image, self.cfg.image_height)
+            target, prefix_context, global_cut, prefix_valid_width = _merge_window(
+                tensor, self.cfg, rng
+            )
+            left_ink = int((target[..., : self.cfg.patch_width] < 0.9).sum())
+            right_ink = int((target[..., self.cfg.patch_width :] < 0.9).sum())
+            score = min(left_ink, right_ink)
+            if score > best_score:
+                best_score = score
+                best = (
+                    record_index,
+                    path,
+                    text,
+                    tensor,
+                    target,
+                    prefix_context,
+                    global_cut,
+                    prefix_valid_width,
+                )
+            if score >= self.cfg.min_half_ink_pixels:
+                break
+        if best is None:
+            raise RuntimeError("failed to sample a merger window")
+        (
+            record_index,
+            path,
+            text,
+            tensor,
+            target,
+            prefix_context,
+            global_cut,
+            prefix_valid_width,
+        ) = best
         valid_width = self.cfg.window_width
 
         sample = make_merge_sample(
@@ -360,20 +549,20 @@ class IAMMergerDataset(Dataset):
             generator,
             force_type=self.force_corruption_type,
             cut=self.cfg.patch_width,
+            include_trace=self.include_trace,
         )
-        # The model receives two independent character images. The combined
-        # tensor remains available only as a target/baseline visualization.
-        sample["left_image"] = sample["naive_concat"][..., : self.cfg.patch_width]
-        sample["right_image"] = sample["naive_concat"][..., self.cfg.patch_width :]
-        sample["left_corruption_mask"] = sample["corruption_mask"][..., : self.cfg.patch_width]
-        sample["right_corruption_mask"] = sample["corruption_mask"][..., self.cfg.patch_width :]
         sample.update(
             {
                 "path": str(path),
                 "text": text,
+                "record_index": record_index,
                 "valid_width": valid_width,
                 "global_cut": global_cut,
+                "source_width": max(self.cfg.window_width, tensor.size(-1)),
+                "prefix_valid_width": prefix_valid_width,
                 "prefix_context": prefix_context,
             }
         )
+        if self.include_trace:
+            sample["source_image"] = tensor
         return sample
