@@ -205,7 +205,7 @@ class MergerTests(unittest.TestCase):
                 (torch.ones_like(left_image), torch.zeros_like(right_image)), dim=-1
             ),
         )
-        self.assertEqual(set(parts), {"loss", "reconstruction_l1", "left_identity_l1"})
+        self.assertEqual(set(parts), {"loss", "reconstruction_mse", "left_identity_mse"})
         loss.backward()
         self.assertTrue(torch.isfinite(loss))
         self.assertTrue(any(parameter.grad is not None for parameter in model.parameters()))

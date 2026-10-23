@@ -40,11 +40,11 @@ def boundary_mask(edit_mask: torch.Tensor) -> torch.Tensor:
 class MergerLoss(nn.Module):
     def __init__(
         self,
-        l1_weight: float = 1.0,
+        mse_weight: float = 1.0,
         left_identity_weight: float = 0.5,
     ) -> None:
         super().__init__()
-        self.l1_weight = l1_weight
+        self.mse_weight = mse_weight
         self.left_identity_weight = left_identity_weight
 
     def forward(
@@ -57,18 +57,21 @@ class MergerLoss(nn.Module):
         left_preservation_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         mask = edit_mask * valid_mask
-        reconstruction_l1 = masked_mean((prediction - target).abs(), mask)
+        reconstruction_mse = masked_mean((prediction - target).square(), mask)
         if input_image is not None and left_preservation_mask is not None:
-            left_identity_l1 = masked_mean(
-                (prediction - input_image).abs(),
+            left_identity_mse = masked_mean(
+                (prediction - input_image).square(),
                 left_preservation_mask * valid_mask,
             )
         else:
-            left_identity_l1 = prediction.new_zeros(())
-        total = self.l1_weight * reconstruction_l1 + self.left_identity_weight * left_identity_l1
+            left_identity_mse = prediction.new_zeros(())
+        total = (
+            self.mse_weight * reconstruction_mse
+            + self.left_identity_weight * left_identity_mse
+        )
         values = {
             "loss": total,
-            "reconstruction_l1": reconstruction_l1,
-            "left_identity_l1": left_identity_l1,
+            "reconstruction_mse": reconstruction_mse,
+            "left_identity_mse": left_identity_mse,
         }
         return total, values

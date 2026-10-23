@@ -57,7 +57,7 @@ model:
   dropout: 0.10
 
 loss:
-  l1_weight: 1.0
+  mse_weight: 1.0
   left_identity_weight: 0.50
 
 training:

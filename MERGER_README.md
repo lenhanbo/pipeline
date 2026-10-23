@@ -15,11 +15,11 @@ prefix token conditions their joint Transformer. The decoder generates every
 pixel of two new `32x32` outputs, which the model joins into the final `32x64`
 canvas. There is no input-to-output residual addition, hard pixel copy, U-Net,
 or skip decoder.
-Training intentionally uses only two masked L1 terms: reconstruction against the
+Training currently uses only two masked MSE terms: reconstruction against the
 clean target over both generated patches, and identity against the naive input
 concatenation over the stable
 part of the left patch. SSIM, Sobel, Charbonnier, boundary, perceptual, GAN, and
-CTC losses are not part of this first baseline.
+CTC losses are not part of this baseline experiment.
 
 This baseline represents one generated character as a square `32x32` patch.
 For each sample, the loader selects a horizontal interval of exactly 64 pixels
